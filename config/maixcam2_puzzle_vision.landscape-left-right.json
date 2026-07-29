@@ -1,0 +1,43 @@
+{
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "exposure_us": -1,
+    "gain": -1,
+    "white_balance": []
+  },
+  "board": {
+    "size_mm": [297, 210],
+    "pixels_per_mm": 2.0,
+    "source_roi_mm": [3, 3, 142, 204],
+    "target_roi_mm": [152, 3, 142, 204],
+    "target_center_mm": [223, 105],
+    "homography_image_to_board": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  },
+  "segmentation": {
+    "delta_e_threshold": 24.0,
+    "min_piece_area_mm2": 150.0,
+    "morphology_radius_mm": 1.0,
+    "polygon_epsilon_mm": 2.5,
+    "collinear_angle_deg": 4.0,
+    "min_edge_mm": 20.0
+  },
+  "solver": {
+    "edge_length_tolerance_mm": 2.0,
+    "edge_length_tolerance_ratio": 0.05,
+    "max_overlap_ratio": 0.01,
+    "min_rectangle_fill_ratio": 0.94,
+    "ambiguity_margin": 0.08,
+    "max_states": 1200,
+    "max_seam_residual_mm": 2.5,
+    "pattern_margin": 0.03,
+    "min_confidence": 0.75
+  },
+  "pattern": {
+    "enabled": true,
+    "ambiguity_score_band": 0.04,
+    "texture_margin": 0.03,
+    "strip_width_px": 10,
+    "strip_length_px": 40
+  }
+}

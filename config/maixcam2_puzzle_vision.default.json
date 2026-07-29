@@ -1,0 +1,29 @@
+{
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "exposure_us": -1,
+    "gain": -1,
+    "white_balance": []
+  },
+  "board": {
+    "size_mm": [210, 297],
+    "pixels_per_mm": 2.0,
+    "source_roi_mm": [3, 3, 204, 142],
+    "target_roi_mm": [3, 152, 204, 142],
+    "target_center_mm": [105, 224.5],
+    "homography_image_to_board": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+  },
+  "segmentation": {
+    "delta_e_threshold": 24.0,
+    "min_piece_area_mm2": 150.0,
+    "morphology_radius_mm": 1.0,
+    "polygon_epsilon_mm": 2.5,
+    "collinear_angle_deg": 4.0,
+    "min_edge_mm": 20.0
+  },
+  "solver": {
+    "min_confidence": 0.75
+  },
+  "pattern": {}
+}
