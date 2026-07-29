@@ -8,8 +8,10 @@ import cv2
 import numpy as np
 
 from .config import AppConfig, load_config
-from .models import PlanResult, SolveStatus
+from .geometry import edge_length, polygon_edges
+from .models import PieceObservation, PlanResult, SolveStatus
 from .pipeline import rectify_frame, solve_frame
+from .segmentation import extract_pieces
 
 
 LONG_PRESS_MS = 800
@@ -44,12 +46,20 @@ class SolveRequest:
         return True
 
 
+def piece_initial_direction_deg(piece: PieceObservation) -> float:
+    """Use the observed longest boundary edge as the piece's direction marker."""
+    start, end = max(polygon_edges(piece.polygon_mm), key=edge_length)
+    return math.degrees(math.atan2(end[1] - start[1], end[0] - start[0]))
+
+
 def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) -> np.ndarray:
     overlay = board_bgr.copy()
     scale = config.board.pixels_per_mm
     status_color = (0, 200, 0) if result.status is SolveStatus.OK else (0, 0, 220)
     target_color = (255, 0, 255)
     target_outline = (0, 0, 0)
+    source_color = (0, 0, 255)
+    source_pieces = {piece.piece_id: piece for piece in extract_pieces(board_bgr, config)}
     cv2.putText(
         overlay,
         f"{result.status.value} confidence={result.confidence:.2f}",
@@ -63,9 +73,41 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
     for command in result.commands:
         pick = tuple(int(round(value * scale)) for value in command.pick_xy_mm)
         place = tuple(int(round(value * scale)) for value in command.place_xy_mm)
+        source_piece = source_pieces.get(command.piece_id)
+        if source_piece is not None:
+            initial_direction_deg = piece_initial_direction_deg(source_piece)
+            initial_theta = math.radians(initial_direction_deg)
+            initial_endpoint = (
+                int(round(pick[0] + 20 * math.cos(initial_theta))),
+                int(round(pick[1] + 20 * math.sin(initial_theta))),
+            )
+            cv2.arrowedLine(overlay, pick, initial_endpoint, target_outline, 4, cv2.LINE_AA, tipLength=0.25)
+            cv2.arrowedLine(overlay, pick, initial_endpoint, source_color, 2, cv2.LINE_AA, tipLength=0.25)
+            initial_label = f"P{command.piece_id} init {initial_direction_deg:+.1f}"
+            initial_label_origin = (pick[0] + 8, pick[1] - 8)
+            cv2.putText(
+                overlay,
+                initial_label,
+                initial_label_origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                target_outline,
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                overlay,
+                initial_label,
+                initial_label_origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                source_color,
+                1,
+                cv2.LINE_AA,
+            )
         theta = math.radians(command.delta_theta_deg)
         endpoint = (int(round(place[0] + 20 * math.cos(theta))), int(round(place[1] + 20 * math.sin(theta))))
-        cv2.circle(overlay, pick, 5, (0, 0, 255), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(overlay, pick, 5, source_color, thickness=-1, lineType=cv2.LINE_AA)
         cv2.circle(overlay, place, 8, target_outline, thickness=-1, lineType=cv2.LINE_AA)
         cv2.circle(overlay, place, 6, target_color, thickness=-1, lineType=cv2.LINE_AA)
         cv2.arrowedLine(overlay, place, endpoint, target_outline, 4, cv2.LINE_AA, tipLength=0.25)
