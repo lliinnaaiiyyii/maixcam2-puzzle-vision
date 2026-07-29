@@ -59,6 +59,8 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
     target_color = (255, 0, 255)
     target_outline = (0, 0, 0)
     source_color = (0, 0, 255)
+    source_outline = (0, 255, 255)
+    assembly_outline = (255, 255, 0)
     source_pieces = {piece.piece_id: piece for piece in extract_pieces(board_bgr, config)}
     cv2.putText(
         overlay,
@@ -70,11 +72,50 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
         2,
         cv2.LINE_AA,
     )
+    for source_piece in source_pieces.values():
+        source_polygon = np.asarray(
+            [tuple(int(round(value * scale)) for value in point) for point in source_piece.polygon_mm],
+            dtype=np.int32,
+        ).reshape((-1, 1, 2))
+        cv2.polylines(overlay, (source_polygon,), True, target_outline, 4, cv2.LINE_AA)
+        cv2.polylines(overlay, (source_polygon,), True, source_outline, 2, cv2.LINE_AA)
+    if result.rectangle_size_mm is not None:
+        rectangle_width, rectangle_height = result.rectangle_size_mm
+        center_x, center_y = config.board.target_center_mm
+        virtual_rectangle = np.asarray(
+            (
+                (center_x - rectangle_width / 2.0, center_y - rectangle_height / 2.0),
+                (center_x + rectangle_width / 2.0, center_y - rectangle_height / 2.0),
+                (center_x + rectangle_width / 2.0, center_y + rectangle_height / 2.0),
+                (center_x - rectangle_width / 2.0, center_y + rectangle_height / 2.0),
+            ),
+            dtype=np.float64,
+        )
+        virtual_rectangle_px = np.asarray(
+            [tuple(int(round(value * scale)) for value in point) for point in virtual_rectangle],
+            dtype=np.int32,
+        ).reshape((-1, 1, 2))
+        cv2.polylines(overlay, (virtual_rectangle_px,), True, target_outline, 5, cv2.LINE_AA)
+        cv2.polylines(overlay, (virtual_rectangle_px,), True, assembly_outline, 2, cv2.LINE_AA)
     for command in result.commands:
         pick = tuple(int(round(value * scale)) for value in command.pick_xy_mm)
         place = tuple(int(round(value * scale)) for value in command.place_xy_mm)
         source_piece = source_pieces.get(command.piece_id)
         if source_piece is not None:
+            theta = math.radians(command.delta_theta_deg)
+            target_polygon_points = []
+            for point in source_piece.polygon_mm:
+                delta_x = point[0] - command.pick_xy_mm[0]
+                delta_y = point[1] - command.pick_xy_mm[1]
+                target_polygon_points.append(
+                    (
+                        int(round(place[0] + scale * (delta_x * math.cos(theta) - delta_y * math.sin(theta)))),
+                        int(round(place[1] + scale * (delta_x * math.sin(theta) + delta_y * math.cos(theta)))),
+                    )
+                )
+            target_polygon = np.asarray(target_polygon_points, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(overlay, (target_polygon,), True, target_outline, 4, cv2.LINE_AA)
+            cv2.polylines(overlay, (target_polygon,), True, assembly_outline, 2, cv2.LINE_AA)
             initial_direction_deg = piece_initial_direction_deg(source_piece)
             initial_theta = math.radians(initial_direction_deg)
             initial_endpoint = (
