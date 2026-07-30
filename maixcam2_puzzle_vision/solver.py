@@ -71,6 +71,11 @@ _MIN_PARTIAL_SEAM_RATIO = 0.15
 _MAX_SOURCE_EDGES_PER_TARGET = 4
 _EQUIVALENT_LAYOUT_POSITION_MM = 20.0
 _EQUIVALENT_LAYOUT_ANGLE_RAD = math.radians(5.0)
+_INTERCHANGEABLE_SLOT_POSITION_MM = 6.0
+_INTERCHANGEABLE_EDGE_TOLERANCE_MM = 4.0
+_INTERCHANGEABLE_EDGE_TOLERANCE_RATIO = 0.12
+_INTERCHANGEABLE_AREA_TOLERANCE_RATIO = 0.15
+_INTERCHANGEABLE_ANGLE_TOLERANCE_RAD = math.radians(10.0)
 _FAST_SKELETON_STATE_LIMIT = 20
 _GLOBAL_FIT_SEED_LIMIT = 8
 _GLOBAL_FIT_STEPS = ((2.0, 2.0), (1.0, 1.0))
@@ -386,6 +391,117 @@ def _layouts_are_equivalent(
     return True
 
 
+def _interior_angles(polygon: tuple[tuple[float, float], ...]) -> tuple[float, ...]:
+    angles = []
+    for index, current in enumerate(polygon):
+        previous = polygon[index - 1]
+        following = polygon[(index + 1) % len(polygon)]
+        previous_vector = (previous[0] - current[0], previous[1] - current[1])
+        following_vector = (following[0] - current[0], following[1] - current[1])
+        denominator = math.hypot(*previous_vector) * math.hypot(*following_vector)
+        if denominator <= 1e-9:
+            return ()
+        cosine = max(-1.0, min(1.0, (previous_vector[0] * following_vector[0] + previous_vector[1] * following_vector[1]) / denominator))
+        angles.append(math.acos(cosine))
+    return tuple(sorted(angles))
+
+
+def _pieces_are_interchangeable(first: PieceObservation, second: PieceObservation) -> bool:
+    if len(first.polygon_mm) != len(second.polygon_mm):
+        return False
+    first_area = abs(polygon_signed_area(first.polygon_mm))
+    second_area = abs(polygon_signed_area(second.polygon_mm))
+    if min(first_area, second_area) <= 1e-6:
+        return False
+    if abs(first_area - second_area) > _INTERCHANGEABLE_AREA_TOLERANCE_RATIO * max(first_area, second_area):
+        return False
+    first_lengths = sorted(edge_length(edge) for edge in polygon_edges(first.polygon_mm))
+    second_lengths = sorted(edge_length(edge) for edge in polygon_edges(second.polygon_mm))
+    for first_length, second_length in zip(first_lengths, second_lengths):
+        tolerance = max(
+            _INTERCHANGEABLE_EDGE_TOLERANCE_MM,
+            _INTERCHANGEABLE_EDGE_TOLERANCE_RATIO * max(first_length, second_length),
+        )
+        if abs(first_length - second_length) > tolerance:
+            return False
+    first_angles = _interior_angles(first.polygon_mm)
+    second_angles = _interior_angles(second.polygon_mm)
+    return bool(first_angles) and all(
+        abs(first_angle - second_angle) <= _INTERCHANGEABLE_ANGLE_TOLERANCE_RAD
+        for first_angle, second_angle in zip(first_angles, second_angles)
+    )
+
+
+def _normalized_layout_slots(
+    transforms: dict[int, RigidTransform2D],
+    pieces_by_id: dict[int, PieceObservation],
+    angle_offset: float = 0.0,
+) -> tuple[tuple[int, tuple[float, float]], ...]:
+    polygons = {
+        piece_id: apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+        for piece_id, transform in transforms.items()
+    }
+    _width, _height, angle = _minimum_rectangle(tuple(polygons.values()))
+    rotated = {
+        piece_id: tuple(rotate_point(point, -(angle + angle_offset)) for point in polygon)
+        for piece_id, polygon in polygons.items()
+    }
+    all_points = tuple(point for polygon in rotated.values() for point in polygon)
+    min_x = min(point[0] for point in all_points)
+    min_y = min(point[1] for point in all_points)
+    slots = []
+    for piece_id, polygon in rotated.items():
+        shifted = tuple((point[0] - min_x, point[1] - min_y) for point in polygon)
+        slots.append((piece_id, polygon_centroid(shifted)))
+    return tuple(slots)
+
+
+def _slots_are_interchangeably_equivalent(
+    first_slots: tuple[tuple[int, tuple[float, float]], ...],
+    second_slots: tuple[tuple[int, tuple[float, float]], ...],
+    pieces_by_id: dict[int, PieceObservation],
+) -> bool:
+    used: set[int] = set()
+    for first_piece_id, first_centroid in first_slots:
+        match_index = None
+        for index, (second_piece_id, second_centroid) in enumerate(second_slots):
+            if index in used:
+                continue
+            if math.hypot(first_centroid[0] - second_centroid[0], first_centroid[1] - second_centroid[1]) > _INTERCHANGEABLE_SLOT_POSITION_MM:
+                continue
+            if not _pieces_are_interchangeable(pieces_by_id[first_piece_id], pieces_by_id[second_piece_id]):
+                continue
+            match_index = index
+            break
+        if match_index is None:
+            return False
+        used.add(match_index)
+    return True
+
+
+def _layouts_are_interchangeably_equivalent(
+    first: dict[int, RigidTransform2D],
+    second: dict[int, RigidTransform2D],
+    pieces_by_id: dict[int, PieceObservation],
+) -> bool:
+    if first.keys() != second.keys():
+        return False
+    first_slots = _normalized_layout_slots(first, pieces_by_id)
+    for angle_offset in (0.0, math.pi / 2.0, math.pi, -math.pi / 2.0):
+        second_slots = _normalized_layout_slots(second, pieces_by_id, angle_offset)
+        if _slots_are_interchangeably_equivalent(first_slots, second_slots, pieces_by_id):
+            return True
+    return False
+
+
+def _layouts_are_effectively_equivalent(
+    first: dict[int, RigidTransform2D],
+    second: dict[int, RigidTransform2D],
+    pieces_by_id: dict[int, PieceObservation],
+) -> bool:
+    return _layouts_are_equivalent(first, second) or _layouts_are_interchangeably_equivalent(first, second, pieces_by_id)
+
+
 def _score_transforms(
     transforms: dict[int, RigidTransform2D],
     pieces_by_id: dict[int, PieceObservation],
@@ -666,7 +782,7 @@ def _solve_constrained_global_fit(
         close_layouts = tuple(
             entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
         )
-        if any(not _layouts_are_equivalent(best[1], entry[1]) for entry in close_layouts):
+        if any(not _layouts_are_effectively_equivalent(best[1], entry[1], pieces_by_id) for entry in close_layouts):
             return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
         SolveStatus.OK,
@@ -989,10 +1105,10 @@ def _solve_skeleton_gap_layout(
             entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
         )
         equivalent_layout_count = 1 + sum(
-            _layouts_are_equivalent(best[1], entry[1]) for entry in close_layouts
+            _layouts_are_effectively_equivalent(best[1], entry[1], pieces_by_id) for entry in close_layouts
         )
         diagnostics["equivalent_layout_count"] = equivalent_layout_count
-        if any(not _layouts_are_equivalent(best[1], entry[1]) for entry in close_layouts):
+        if any(not _layouts_are_effectively_equivalent(best[1], entry[1], pieces_by_id) for entry in close_layouts):
             return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
         SolveStatus.OK,
