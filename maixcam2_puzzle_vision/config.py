@@ -99,9 +99,8 @@ def rectangle_size_is_within_topic_limit(width: float, height: float, config: So
     short_side, long_side = sorted((width, height))
     tolerance = config.rectangle_size_tolerance_mm
     return (
-        short_side >= max(config.min_rectangle_side_mm, config.min_rectangle_short_side_mm - tolerance)
+        short_side >= config.min_rectangle_side_mm
         and short_side <= config.max_rectangle_short_side_mm + tolerance
-        and long_side >= config.min_rectangle_long_side_mm - tolerance
         and long_side <= config.max_rectangle_long_side_mm + tolerance
     )
 

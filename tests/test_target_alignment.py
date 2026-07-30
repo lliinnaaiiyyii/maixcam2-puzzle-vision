@@ -84,3 +84,19 @@ def test_planner_rejects_rectangle_with_long_side_above_topic_limit() -> None:
 
     assert result.status is SolveStatus.NO_RECTANGLE_SOLUTION
     assert result.diagnostics["planner_error"] == "rectangle_size_outside_topic_limit"
+
+
+def test_planner_allows_small_rectangle_when_it_stays_under_topic_maximum() -> None:
+    polygon = ((20.0, 20.0), (100.0, 20.0), (100.0, 65.0), (20.0, 65.0))
+    piece = PieceObservation(0, polygon, polygon_centroid(polygon))
+    assembly = AssemblyResult(
+        status=SolveStatus.OK,
+        transforms={0: RigidTransform2D()},
+        fill_ratio=1.0,
+        score=0.0,
+    )
+
+    result = plan_assembly((piece,), assembly, _landscape_config())
+
+    assert result.status is SolveStatus.OK
+    assert result.rectangle_size_mm == (45.0, 80.0)
