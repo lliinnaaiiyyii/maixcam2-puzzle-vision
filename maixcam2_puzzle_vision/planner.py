@@ -19,6 +19,13 @@ def _inside_roi(point: tuple[float, float], roi: tuple[float, float, float, floa
     return x <= point[0] <= x + width and y <= point[1] <= y + height
 
 
+def _polygon_inside_roi(
+    polygon: tuple[tuple[float, float], ...],
+    roi: tuple[float, float, float, float],
+) -> bool:
+    return all(_inside_roi(point, roi) for point in polygon)
+
+
 def _interior_pick(polygon: tuple[tuple[float, float], ...]) -> tuple[float, float]:
     centroid = polygon_centroid(polygon)
     if point_in_polygon(centroid, polygon):
@@ -46,6 +53,15 @@ def plan_assembly(pieces: tuple[PieceObservation, ...], assembly: AssemblyResult
     normalizer = RigidTransform2D(-angle, -min_x, -min_y)
     target_origin = (config.board.target_center_mm[0] - width / 2.0, config.board.target_center_mm[1] - height / 2.0)
     target_transform = compose(RigidTransform2D(0.0, *target_origin), normalizer)
+    target_polygons = tuple(
+        apply_transform_polygon(piece.polygon_mm, compose(target_transform, assembly.transforms[piece.piece_id]))
+        for piece in pieces
+    )
+    if not all(_polygon_inside_roi(polygon, config.board.target_roi_mm) for polygon in target_polygons):
+        return PlanResult.failure(
+            SolveStatus.NO_RECTANGLE_SOLUTION,
+            {**assembly.diagnostics, "planner_error": "assembled_rectangle_outside_target_roi"},
+        )
     confidence = max(0.0, min(1.0, 0.5 * assembly.fill_ratio + 0.4 * max(0.0, 1.0 - assembly.score) + 0.1))
     if confidence < config.solver.min_confidence:
         return PlanResult(

@@ -259,6 +259,10 @@ def _minimum_rectangle(polygons: tuple[tuple[tuple[float, float], ...], ...]) ->
     return best
 
 
+def _has_usable_rectangle_size(width: float, height: float, config: SolverConfig) -> bool:
+    return min(width, height) >= config.min_rectangle_side_mm
+
+
 def _seam_residual(state: _State, pieces_by_id: dict[int, PieceObservation]) -> float:
     if not state.seams:
         return 0.0
@@ -281,7 +285,7 @@ def _score_state(state: _State, pieces_by_id: dict[int, PieceObservation], confi
     )
     width, height, _ = _minimum_rectangle(polygons)
     short_side, long_side = sorted((width, height))
-    if not 50.0 <= short_side <= 90.0 or not 90.0 <= long_side <= 120.0:
+    if not _has_usable_rectangle_size(width, height, config):
         return None
     rectangle_area = width * height
     if rectangle_area <= 1e-6:
@@ -357,7 +361,7 @@ def _score_transforms(
     )
     width, height, _ = _minimum_rectangle(polygons)
     short_side, long_side = sorted((width, height))
-    if not 50.0 <= short_side <= 90.0 or not 90.0 <= long_side <= 120.0:
+    if not _has_usable_rectangle_size(width, height, config):
         return None
     rectangle_area = width * height
     if rectangle_area <= 1e-6:
@@ -472,7 +476,7 @@ def _solve_segmented_anchor_layout(
                     )
                     width, height, _ = _minimum_rectangle(polygons)
                     short_side, long_side = sorted((width, height))
-                    if not 50.0 <= short_side <= 90.0 or not 90.0 <= long_side <= 120.0:
+                    if not _has_usable_rectangle_size(width, height, config):
                         continue
                     rectangle_area = width * height
                     if rectangle_area <= 1e-6:
@@ -485,11 +489,9 @@ def _solve_segmented_anchor_layout(
                     overlap = sum(polygon_intersection_area(first, second) for first, second in combinations(polygons, 2))
                     if overlap > 0.03 * total_area:
                         continue
-                    expected_aspect = 100.0 / 60.0
                     score = (
                         (1.0 - min(fill_ratio, 1.0))
                         + 5.0 * overlap / max(total_area, 1e-6)
-                        + 0.1 * abs(long_side / short_side - expected_aspect)
                     )
                     candidates.append((score, transforms, (long_side, short_side), fill_ratio, overlap))
     if not candidates:

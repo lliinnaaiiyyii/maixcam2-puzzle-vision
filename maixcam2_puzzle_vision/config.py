@@ -45,6 +45,7 @@ class SolverConfig:
     edge_length_tolerance_mm: float = 2.0
     edge_length_tolerance_ratio: float = 0.05
     max_overlap_ratio: float = 0.02
+    min_rectangle_side_mm: float = 20.0
     min_rectangle_fill_ratio: float = 0.94
     max_internal_hole_mm2: float = 25.0
     ambiguity_margin: float = 0.04
@@ -145,10 +146,13 @@ def load_config(path: str | Path) -> AppConfig:
     )
     if segmentation.min_piece_area_mm2 <= 0 or segmentation.morphology_radius_mm < 0 or segmentation.min_edge_mm <= 0:
         raise ValueError("segmentation settings are outside topic constraints")
+    solver = SolverConfig(**raw.get("solver", {}))
+    if not math.isfinite(solver.min_rectangle_side_mm) or solver.min_rectangle_side_mm <= 0:
+        raise ValueError("solver.min_rectangle_side_mm must be positive")
     return AppConfig(
         camera=camera,
         board=board,
         segmentation=segmentation,
-        solver=SolverConfig(**raw.get("solver", {})),
+        solver=solver,
         pattern=PatternConfig(**raw.get("pattern", {})),
     )
