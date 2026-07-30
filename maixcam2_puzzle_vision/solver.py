@@ -61,6 +61,8 @@ class _PartialState:
 _PARTIAL_POSITIONS = (0.0, 0.25, 0.5, 0.75, 1.0)
 _MIN_PARTIAL_SEAM_RATIO = 0.15
 _MAX_SOURCE_EDGES_PER_TARGET = 4
+_EQUIVALENT_LAYOUT_POSITION_MM = 20.0
+_EQUIVALENT_LAYOUT_ANGLE_RAD = math.radians(5.0)
 
 
 def _cross(edge: tuple[tuple[float, float], tuple[float, float]], point: tuple[float, float]) -> float:
@@ -346,6 +348,29 @@ def _layout_cluster_signature(
             )
         )
     return tuple(signature)
+
+
+def _layouts_are_equivalent(
+    first: dict[int, RigidTransform2D],
+    second: dict[int, RigidTransform2D],
+) -> bool:
+    if first.keys() != second.keys():
+        return False
+    anchor_id = min(first)
+    first_anchor_inverse = inverse(first[anchor_id])
+    second_anchor_inverse = inverse(second[anchor_id])
+    for piece_id in first:
+        first_relative = compose(first_anchor_inverse, first[piece_id])
+        second_relative = compose(second_anchor_inverse, second[piece_id])
+        angle_delta = (first_relative.angle_rad - second_relative.angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+        if abs(angle_delta) > _EQUIVALENT_LAYOUT_ANGLE_RAD:
+            return False
+        if math.hypot(
+            first_relative.tx_mm - second_relative.tx_mm,
+            first_relative.ty_mm - second_relative.ty_mm,
+        ) > _EQUIVALENT_LAYOUT_POSITION_MM:
+            return False
+    return True
 
 
 def _score_transforms(
@@ -659,7 +684,14 @@ def _solve_skeleton_gap_layout(
     diagnostics["best_score"] = best[0]
     if len(ranked) > 1:
         diagnostics["second_score"] = ranked[1][0]
-        if ranked[1][0] - best[0] < config.ambiguity_margin:
+        close_layouts = tuple(
+            entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
+        )
+        equivalent_layout_count = 1 + sum(
+            _layouts_are_equivalent(best[1], entry[1]) for entry in close_layouts
+        )
+        diagnostics["equivalent_layout_count"] = equivalent_layout_count
+        if any(not _layouts_are_equivalent(best[1], entry[1]) for entry in close_layouts):
             return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
         SolveStatus.OK,
