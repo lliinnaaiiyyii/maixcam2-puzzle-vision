@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -65,12 +65,27 @@ class PatternConfig:
 
 
 @dataclass(frozen=True)
+class AutoCalibrationConfig:
+    enabled: bool = True
+    hue_min: int = 35
+    hue_max: int = 95
+    saturation_min: int = 80
+    value_min: int = 60
+    min_area_ratio: float = 0.15
+    border_margin_px: int = 4
+    stable_frames: int = 3
+    corner_stability_px: float = 6.0
+    processing_width: int = 640
+
+
+@dataclass(frozen=True)
 class AppConfig:
     camera: CameraConfig
     board: BoardConfig
     segmentation: SegmentationConfig
     solver: SolverConfig
     pattern: PatternConfig
+    auto_calibration: AutoCalibrationConfig = field(default_factory=AutoCalibrationConfig)
 
 
 def _tuple(values: Any, length: int, label: str) -> tuple[float, ...]:
@@ -149,10 +164,22 @@ def load_config(path: str | Path) -> AppConfig:
     solver = SolverConfig(**raw.get("solver", {}))
     if not math.isfinite(solver.min_rectangle_side_mm) or solver.min_rectangle_side_mm <= 0:
         raise ValueError("solver.min_rectangle_side_mm must be positive")
+    auto_calibration = AutoCalibrationConfig(**raw.get("auto_calibration", {}))
+    if not 0 <= auto_calibration.hue_min < auto_calibration.hue_max <= 179:
+        raise ValueError("auto_calibration hue range must be inside [0, 179]")
+    if not 0 <= auto_calibration.saturation_min <= 255 or not 0 <= auto_calibration.value_min <= 255:
+        raise ValueError("auto_calibration saturation/value minimum must be inside [0, 255]")
+    if not 0 < auto_calibration.min_area_ratio <= 1:
+        raise ValueError("auto_calibration.min_area_ratio must be inside (0, 1]")
+    if auto_calibration.border_margin_px < 0 or auto_calibration.stable_frames < 1 or auto_calibration.processing_width < 64:
+        raise ValueError("auto_calibration dimensions are invalid")
+    if not math.isfinite(auto_calibration.corner_stability_px) or auto_calibration.corner_stability_px <= 0:
+        raise ValueError("auto_calibration.corner_stability_px must be positive")
     return AppConfig(
         camera=camera,
         board=board,
         segmentation=segmentation,
         solver=solver,
         pattern=PatternConfig(**raw.get("pattern", {})),
+        auto_calibration=auto_calibration,
     )

@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .auto_calibration import AutoBoardCalibrator, AutoCalibrationObservation, config_from_auto_calibration
 from .config import AppConfig, load_config
 from .geometry import edge_length, polygon_edges
 from .models import PieceObservation, PlanResult, SolveStatus
@@ -34,6 +35,27 @@ def solution_paths(module_path: Path | None = None) -> tuple[str, str]:
         (app_directory / "solution.jpg").as_posix(),
         (app_directory / "solution.json").as_posix(),
     )
+
+
+def draw_auto_calibration(frame_bgr: np.ndarray, observation: AutoCalibrationObservation, required_frames: int) -> np.ndarray:
+    overlay = frame_bgr.copy()
+    if observation.corners is None:
+        cv2.putText(overlay, "FINDING GREEN A4", (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(overlay, "FINDING GREEN A4", (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2, cv2.LINE_AA)
+        return overlay
+    corners = np.asarray(observation.corners, dtype=np.int32).reshape((-1, 1, 2))
+    cv2.polylines(overlay, (corners,), True, (0, 0, 0), 6, cv2.LINE_AA)
+    cv2.polylines(overlay, (corners,), True, (255, 0, 255), 2, cv2.LINE_AA)
+    for index, corner in enumerate(corners[:, 0, :]):
+        point = (int(corner[0]), int(corner[1]))
+        cv2.circle(overlay, point, 7, (0, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(overlay, point, 4, (255, 0, 255), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.putText(overlay, str(index), (point[0] + 8, point[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(overlay, str(index), (point[0] + 8, point[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    label = f"A4 CALIBRATING {observation.stable_frames}/{required_frames}"
+    cv2.putText(overlay, label, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(overlay, label, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
+    return overlay
 
 
 def key_release_action(duration_ms: int, long_press_ms: int = LONG_PRESS_MS) -> str:
@@ -318,8 +340,10 @@ def main(config_path: str | None = None) -> None:
 
     default_config_path, calibration_image_path = application_paths()
     solution_image_path, solution_payload_path = solution_paths()
-    config = load_config(config_path or default_config_path)
-    cam = camera.Camera(config.camera.width, config.camera.height, image.Format.FMT_BGR888)
+    base_config = load_config(config_path or default_config_path)
+    active_config: AppConfig | None = None if base_config.auto_calibration.enabled else base_config
+    auto_calibrator = AutoBoardCalibrator(base_config.auto_calibration)
+    cam = camera.Camera(base_config.camera.width, base_config.camera.height, image.Format.FMT_BGR888)
     screen = display.Display()
     try:
         lower_controller_uart = uart.UART("/dev/ttyS4", 115200)
@@ -343,6 +367,12 @@ def main(config_path: str | None = None) -> None:
     press_started_ms: int | None = None
     latest_overlay: np.ndarray | None = None
 
+    def reset_auto_calibration() -> None:
+        nonlocal active_config
+        auto_solve.reset()
+        auto_calibrator.reset()
+        active_config = None if base_config.auto_calibration.enabled else base_config
+
     def on_key(_key_id: int, state: int) -> None:
         nonlocal press_started_ms
         now_ms = time.ticks_ms()
@@ -361,20 +391,44 @@ def main(config_path: str | None = None) -> None:
         maix_frame = cam.read()
         frame_bgr = image.image2cv(maix_frame, ensure_bgr=True, copy=True)
         if capture_request.consume():
-            auto_solve.reset()
+            reset_auto_calibration()
             maix_frame.save(calibration_image_path)
             latest_overlay = frame_bgr.copy()
             cv2.putText(latest_overlay, "Saved calibration.jpg", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 210, 0), 2, cv2.LINE_AA)
             print(json.dumps({"status": "CALIBRATION_CAPTURED", "path": calibration_image_path}), flush=True)
         manual_solve = solve_request.consume()
         if manual_solve:
-            auto_solve.reset()
+            reset_auto_calibration()
+        if active_config is None:
+            observation = auto_calibrator.observe(frame_bgr)
+            latest_overlay = draw_auto_calibration(frame_bgr, observation, base_config.auto_calibration.stable_frames)
+            if not observation.ready or observation.corners is None:
+                screen.show(image.cv2image(latest_overlay, bgr=True, copy=False))
+                continue
+            try:
+                active_config = config_from_auto_calibration(base_config, observation.corners)
+            except ValueError as error:
+                auto_calibrator.reset()
+                print(json.dumps({"status": "AUTO_CALIBRATION_FAILED", "error": str(error)}, ensure_ascii=False), flush=True)
+                screen.show(image.cv2image(latest_overlay, bgr=True, copy=False))
+                continue
+            print(
+                json.dumps(
+                    {
+                        "status": "AUTO_CALIBRATED",
+                        "corners_px": [[round(value, 1) for value in corner] for corner in observation.corners],
+                        "stable_frames": observation.stable_frames,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
         if auto_solve.should_solve() or manual_solve:
-            result = solve_frame(frame_bgr, config)
-            board = rectify_frame(frame_bgr, config)
-            latest_overlay = draw_solution(board if board is not None else frame_bgr, result, config)
-            pieces = extract_pieces(board, config) if board is not None else ()
-            payload = build_machine_payload(result, pieces, config)
+            result = solve_frame(frame_bgr, active_config)
+            board = rectify_frame(frame_bgr, active_config)
+            latest_overlay = draw_solution(board if board is not None else frame_bgr, result, active_config)
+            pieces = extract_pieces(board, active_config) if board is not None else ()
+            payload = build_machine_payload(result, pieces, active_config)
             auto_solve.record_result(result)
             if result.status is SolveStatus.OK:
                 cv2.imwrite(solution_image_path, latest_overlay)

@@ -24,10 +24,10 @@ python -m maixcam2_puzzle_vision.cli --image tests_maixcam2_puzzle_vision/genera
 
 ## MaixCAM2 标定和部署
 
-1. 当前部署使用横向 A4：确保完整纸面入镜，四块碎片放在左半区，右半区保持清空作为拼接区。标定后不得改变焦距、分辨率、曝光、白平衡或相机与 A4 的相对位置。
-2. 部署包内的 `config/maixcam2_puzzle_vision.json` 是横向配置，坐标左上角为 `(0, 0)`，右下角为 `(297, 210)`；左侧为源区、右侧为目标区。仓库中的单应矩阵只对应当前示例相机位置，换用设备、相机高度或 A4 纸位置后必须重新标定。
+1. 当前部署使用横向绿色 A4：确保完整纸面和四个纸角入镜，四块碎片放在左半区，右半区保持清空作为拼接区。绿色 A4 外侧背景不得使用相近绿色，纸角不得被手、龙门架或碎片遮挡。
+2. 部署包内的 `config/maixcam2_puzzle_vision.json` 是横向配置，坐标左上角为 `(0, 0)`，右下角为 `(297, 210)`；左侧为源区、右侧为目标区。APP 启动后会在缩小画面中检测绿色 A4 的最大凸四边形，连续 3 帧稳定后自动计算本次的像素到毫米矩阵。因此相机高度、俯仰角或 A4 位置存在小偏差时，无需重新手动标定。
 
-在电脑上重新标定时，先从 MaixCAM2 下载新的 `calibration.jpg`，然后运行：
+自动检测无法通过时，可使用手动标定兜底：先从 MaixCAM2 下载新的 `calibration.jpg`，然后运行：
 
 ```powershell
 python calibrate.py --image calibration.jpg --config config/maixcam2_puzzle_vision.json
@@ -42,7 +42,7 @@ cd /root/app1
 python3 main.py
 ```
 
-程序启动后会自动连续识别和预测，不需要短按按键。首次得到 `status: "OK"` 后会定格当前识别结果，保存 `/root/app1/solution.jpg` 和 `/root/app1/solution.json`，并在屏幕上保留带 A4 边框、中线、源区轮廓、预测矩形、碎片编号、几何中心坐标和旋转角度的标注图。短按按键可清除定格并重新进入自动识别；按键时长不小于 `800 ms` 时仅保存 `/root/app1/calibration.jpg`，不会触发求解。
+程序启动后会先显示绿色 A4 的四角和 `A4 CALIBRATING 1/3` 状态；连续 3 帧稳定后自动连续识别和预测，不需要短按按键。未检测到完整 A4 时，程序不会求解或发送串口帧。首次得到 `status: "OK"` 后会定格当前识别结果，保存 `/root/app1/solution.jpg` 和 `/root/app1/solution.json`，并在屏幕上保留带 A4 边框、中线、源区轮廓、预测矩形、碎片编号、几何中心坐标和旋转角度的标注图。短按按键会重新检测 A4 四角后再进入自动识别；按键时长不小于 `800 ms` 时会保存 `/root/app1/calibration.jpg` 并重新自动标定。
 
 预测矩形的四条边始终与 A4 坐标系平行。程序会让预测矩形的长边平行于目标区的长边、短边平行于目标区的短边；当前横向 A4 的右半目标区长边为竖直方向，因此较长的拼图边会竖直放置。
 
