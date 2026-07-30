@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from itertools import combinations, permutations, product
 from typing import Callable
 
-from .config import SolverConfig
+from .config import SolverConfig, rectangle_size_is_within_topic_limit
 from .geometry import (
     align_reversed_edges,
     apply_transform_polygon,
@@ -275,7 +275,7 @@ def _minimum_rectangle(polygons: tuple[tuple[tuple[float, float], ...], ...]) ->
 
 
 def _has_usable_rectangle_size(width: float, height: float, config: SolverConfig) -> bool:
-    return min(width, height) >= config.min_rectangle_side_mm
+    return rectangle_size_is_within_topic_limit(width, height, config)
 
 
 def _seam_residual(state: _State, pieces_by_id: dict[int, PieceObservation]) -> float:

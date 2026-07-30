@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from .config import AppConfig
+from .config import AppConfig, rectangle_size_is_within_topic_limit
 from .geometry import (
     apply_transform,
     apply_transform_polygon,
@@ -50,6 +50,15 @@ def plan_assembly(pieces: tuple[PieceObservation, ...], assembly: AssemblyResult
         return PlanResult.failure(assembly.status, assembly.diagnostics)
     placed = tuple(apply_transform_polygon(piece.polygon_mm, assembly.transforms[piece.piece_id]) for piece in pieces)
     angle, min_x, min_y, width, height = oriented_bounding_box(placed)
+    if not rectangle_size_is_within_topic_limit(width, height, config.solver):
+        return PlanResult.failure(
+            SolveStatus.NO_RECTANGLE_SOLUTION,
+            {
+                **assembly.diagnostics,
+                "planner_error": "rectangle_size_outside_topic_limit",
+                "rectangle_size_mm": [round(width, 3), round(height, 3)],
+            },
+        )
     normalizer = RigidTransform2D(-angle, -min_x, -min_y)
     target_roi_width, target_roi_height = config.board.target_roi_mm[2:]
     rectangle_is_wide = width > height

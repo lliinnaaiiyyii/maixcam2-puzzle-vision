@@ -68,3 +68,19 @@ def test_planner_aligns_horizontal_rectangle_long_side_with_tall_target_roi() ->
     assert max(xs) <= 294.0
     assert min(ys) >= 3.0
     assert max(ys) <= 207.0
+
+
+def test_planner_rejects_rectangle_with_long_side_above_topic_limit() -> None:
+    polygon = ((20.0, 20.0), (170.0, 20.0), (170.0, 80.0), (20.0, 80.0))
+    piece = PieceObservation(0, polygon, polygon_centroid(polygon))
+    assembly = AssemblyResult(
+        status=SolveStatus.OK,
+        transforms={0: RigidTransform2D()},
+        fill_ratio=1.0,
+        score=0.0,
+    )
+
+    result = plan_assembly((piece,), assembly, _landscape_config())
+
+    assert result.status is SolveStatus.NO_RECTANGLE_SOLUTION
+    assert result.diagnostics["planner_error"] == "rectangle_size_outside_topic_limit"

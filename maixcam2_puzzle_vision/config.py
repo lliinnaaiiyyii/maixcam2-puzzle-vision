@@ -46,6 +46,11 @@ class SolverConfig:
     edge_length_tolerance_ratio: float = 0.05
     max_overlap_ratio: float = 0.02
     min_rectangle_side_mm: float = 20.0
+    min_rectangle_short_side_mm: float = 50.0
+    max_rectangle_short_side_mm: float = 90.0
+    min_rectangle_long_side_mm: float = 90.0
+    max_rectangle_long_side_mm: float = 120.0
+    rectangle_size_tolerance_mm: float = 1.0
     min_rectangle_fill_ratio: float = 0.94
     max_internal_hole_mm2: float = 25.0
     ambiguity_margin: float = 0.04
@@ -86,6 +91,19 @@ class AppConfig:
     solver: SolverConfig
     pattern: PatternConfig
     auto_calibration: AutoCalibrationConfig = field(default_factory=AutoCalibrationConfig)
+
+
+def rectangle_size_is_within_topic_limit(width: float, height: float, config: SolverConfig) -> bool:
+    if not math.isfinite(width) or not math.isfinite(height):
+        return False
+    short_side, long_side = sorted((width, height))
+    tolerance = config.rectangle_size_tolerance_mm
+    return (
+        short_side >= max(config.min_rectangle_side_mm, config.min_rectangle_short_side_mm - tolerance)
+        and short_side <= config.max_rectangle_short_side_mm + tolerance
+        and long_side >= config.min_rectangle_long_side_mm - tolerance
+        and long_side <= config.max_rectangle_long_side_mm + tolerance
+    )
 
 
 def _tuple(values: Any, length: int, label: str) -> tuple[float, ...]:
@@ -164,6 +182,23 @@ def load_config(path: str | Path) -> AppConfig:
     solver = SolverConfig(**raw.get("solver", {}))
     if not math.isfinite(solver.min_rectangle_side_mm) or solver.min_rectangle_side_mm <= 0:
         raise ValueError("solver.min_rectangle_side_mm must be positive")
+    rectangle_limits = (
+        solver.min_rectangle_short_side_mm,
+        solver.max_rectangle_short_side_mm,
+        solver.min_rectangle_long_side_mm,
+        solver.max_rectangle_long_side_mm,
+        solver.rectangle_size_tolerance_mm,
+    )
+    if not all(math.isfinite(value) for value in rectangle_limits):
+        raise ValueError("solver rectangle size limits must be finite")
+    if (
+        solver.min_rectangle_short_side_mm <= 0
+        or solver.max_rectangle_short_side_mm < solver.min_rectangle_short_side_mm
+        or solver.min_rectangle_long_side_mm < solver.min_rectangle_short_side_mm
+        or solver.max_rectangle_long_side_mm < solver.min_rectangle_long_side_mm
+        or solver.rectangle_size_tolerance_mm < 0
+    ):
+        raise ValueError("solver rectangle size limits are invalid")
     auto_calibration = AutoCalibrationConfig(**raw.get("auto_calibration", {}))
     if not 0 <= auto_calibration.hue_min < auto_calibration.hue_max <= 179:
         raise ValueError("auto_calibration hue range must be inside [0, 179]")
