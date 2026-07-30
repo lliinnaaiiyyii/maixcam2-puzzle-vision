@@ -26,6 +26,15 @@ def application_paths(module_path: Path | None = None) -> tuple[str, str]:
     )
 
 
+def solution_paths(module_path: Path | None = None) -> tuple[str, str]:
+    package_file = Path(__file__).resolve() if module_path is None else Path(module_path)
+    app_directory = package_file.parent.parent
+    return (
+        (app_directory / "solution.jpg").as_posix(),
+        (app_directory / "solution.json").as_posix(),
+    )
+
+
 def key_release_action(duration_ms: int, long_press_ms: int = LONG_PRESS_MS) -> str:
     return "capture" if duration_ms >= long_press_ms else "solve"
 
@@ -46,10 +55,82 @@ class SolveRequest:
         return True
 
 
+class AutoSolveController:
+    """Run recognition until the first successful layout, then keep it frozen."""
+
+    def __init__(self) -> None:
+        self._frozen = False
+
+    def should_solve(self) -> bool:
+        return not self._frozen
+
+    def record_result(self, result: PlanResult) -> None:
+        if result.status is SolveStatus.OK:
+            self._frozen = True
+
+    def reset(self) -> None:
+        self._frozen = False
+
+
 def piece_initial_direction_deg(piece: PieceObservation) -> float:
     """Use the observed longest boundary edge as the piece's direction marker."""
     start, end = max(polygon_edges(piece.polygon_mm), key=edge_length)
     return math.degrees(math.atan2(end[1] - start[1], end[0] - start[0]))
+
+
+def _round_mm(value: float) -> float:
+    return round(float(value), 3)
+
+
+def _target_centroid(command, piece: PieceObservation) -> tuple[float, float]:
+    theta = math.radians(command.delta_theta_deg)
+    delta_x = piece.centroid_mm[0] - command.pick_xy_mm[0]
+    delta_y = piece.centroid_mm[1] - command.pick_xy_mm[1]
+    return (
+        command.place_xy_mm[0] + delta_x * math.cos(theta) - delta_y * math.sin(theta),
+        command.place_xy_mm[1] + delta_x * math.sin(theta) + delta_y * math.cos(theta),
+    )
+
+
+def build_machine_payload(
+    result: PlanResult,
+    pieces: tuple[PieceObservation, ...],
+    config: AppConfig,
+) -> dict[str, object]:
+    payload: dict[str, object] = result.to_dict()
+    payload["coordinate_frame"] = {
+        "origin": "A4_TOP_LEFT",
+        "x_axis": "right_mm",
+        "y_axis": "down_mm",
+        "unit": "mm",
+        "board_size_mm": [_round_mm(value) for value in config.board.size_mm],
+    }
+    if result.status is not SolveStatus.OK:
+        payload["pieces"] = []
+        return payload
+    pieces_by_id = {piece.piece_id: piece for piece in pieces}
+    machine_pieces = []
+    for command in result.commands:
+        piece = pieces_by_id.get(command.piece_id)
+        if piece is None:
+            continue
+        target_center = _target_centroid(command, piece)
+        machine_pieces.append(
+            {
+                "piece_id": command.piece_id,
+                "source_center_x_mm": _round_mm(piece.centroid_mm[0]),
+                "source_center_y_mm": _round_mm(piece.centroid_mm[1]),
+                "target_center_x_mm": _round_mm(target_center[0]),
+                "target_center_y_mm": _round_mm(target_center[1]),
+                "rotation_deg": _round_mm(command.delta_theta_deg),
+                "pick_x_mm": _round_mm(command.pick_xy_mm[0]),
+                "pick_y_mm": _round_mm(command.pick_xy_mm[1]),
+                "place_x_mm": _round_mm(command.place_xy_mm[0]),
+                "place_y_mm": _round_mm(command.place_xy_mm[1]),
+            }
+        )
+    payload["pieces"] = machine_pieces
+    return payload
 
 
 def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) -> np.ndarray:
@@ -63,6 +144,7 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
     assembly_outline = (255, 255, 0)
     board_outline = (255, 180, 0)
     divider_color = (0, 165, 255)
+    centroid_color = (255, 255, 255)
     source_pieces = {piece.piece_id: piece for piece in extract_pieces(board_bgr, config)}
     board_width = int(round(config.board.size_mm[0] * scale))
     board_height = int(round(config.board.size_mm[1] * scale))
@@ -90,8 +172,35 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
             [tuple(int(round(value * scale)) for value in point) for point in source_piece.polygon_mm],
             dtype=np.int32,
         ).reshape((-1, 1, 2))
+        source_center = tuple(int(round(value * scale)) for value in source_piece.centroid_mm)
         cv2.polylines(overlay, (source_polygon,), True, target_outline, 4, cv2.LINE_AA)
         cv2.polylines(overlay, (source_polygon,), True, source_outline, 2, cv2.LINE_AA)
+        cv2.circle(overlay, source_center, 5, target_outline, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(overlay, source_center, 3, centroid_color, thickness=-1, lineType=cv2.LINE_AA)
+        source_center_label = (
+            f"P{source_piece.piece_id} S({_round_mm(source_piece.centroid_mm[0])},"
+            f"{_round_mm(source_piece.centroid_mm[1])})"
+        )
+        cv2.putText(
+            overlay,
+            source_center_label,
+            (source_center[0] + 8, source_center[1] + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.36,
+            target_outline,
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            source_center_label,
+            (source_center[0] + 8, source_center[1] + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.36,
+            centroid_color,
+            1,
+            cv2.LINE_AA,
+        )
     if result.rectangle_size_mm is not None:
         rectangle_width, rectangle_height = result.rectangle_size_mm
         center_x, center_y = config.board.target_center_mm
@@ -116,6 +225,8 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
         source_piece = source_pieces.get(command.piece_id)
         if source_piece is not None:
             theta = math.radians(command.delta_theta_deg)
+            target_center_mm = _target_centroid(command, source_piece)
+            target_center = tuple(int(round(value * scale)) for value in target_center_mm)
             target_polygon_points = []
             for point in source_piece.polygon_mm:
                 delta_x = point[0] - command.pick_xy_mm[0]
@@ -159,6 +270,33 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
                 1,
                 cv2.LINE_AA,
             )
+            cv2.circle(overlay, target_center, 5, target_outline, thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(overlay, target_center, 3, centroid_color, thickness=-1, lineType=cv2.LINE_AA)
+            target_center_label = (
+                f"P{command.piece_id} T({_round_mm(target_center_mm[0])},"
+                f"{_round_mm(target_center_mm[1])}) R{_round_mm(command.delta_theta_deg):+g}"
+            )
+            target_center_origin = (target_center[0] + 8, target_center[1] + 14)
+            cv2.putText(
+                overlay,
+                target_center_label,
+                target_center_origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.36,
+                target_outline,
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                overlay,
+                target_center_label,
+                target_center_origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.36,
+                centroid_color,
+                1,
+                cv2.LINE_AA,
+            )
         theta = math.radians(command.delta_theta_deg)
         endpoint = (int(round(place[0] + 20 * math.cos(theta))), int(round(place[1] + 20 * math.sin(theta))))
         cv2.circle(overlay, pick, 5, source_color, thickness=-1, lineType=cv2.LINE_AA)
@@ -178,9 +316,11 @@ def main(config_path: str | None = None) -> None:
     from maix import app, camera, display, image, key, time
 
     default_config_path, calibration_image_path = application_paths()
+    solution_image_path, solution_payload_path = solution_paths()
     config = load_config(config_path or default_config_path)
     cam = camera.Camera(config.camera.width, config.camera.height, image.Format.FMT_BGR888)
     screen = display.Display()
+    auto_solve = AutoSolveController()
     solve_request = SolveRequest()
     capture_request = SolveRequest()
     press_started_ms: int | None = None
@@ -204,15 +344,28 @@ def main(config_path: str | None = None) -> None:
         maix_frame = cam.read()
         frame_bgr = image.image2cv(maix_frame, ensure_bgr=True, copy=True)
         if capture_request.consume():
+            auto_solve.reset()
             maix_frame.save(calibration_image_path)
             latest_overlay = frame_bgr.copy()
             cv2.putText(latest_overlay, "Saved calibration.jpg", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 210, 0), 2, cv2.LINE_AA)
             print(json.dumps({"status": "CALIBRATION_CAPTURED", "path": calibration_image_path}), flush=True)
-        if solve_request.consume():
+        manual_solve = solve_request.consume()
+        if manual_solve:
+            auto_solve.reset()
+        if auto_solve.should_solve() or manual_solve:
             result = solve_frame(frame_bgr, config)
             board = rectify_frame(frame_bgr, config)
             latest_overlay = draw_solution(board if board is not None else frame_bgr, result, config)
-            print(json.dumps(result.to_dict(), ensure_ascii=False), flush=True)
+            pieces = extract_pieces(board, config) if board is not None else ()
+            payload = build_machine_payload(result, pieces, config)
+            auto_solve.record_result(result)
+            if result.status is SolveStatus.OK:
+                cv2.imwrite(solution_image_path, latest_overlay)
+                Path(solution_payload_path).write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
         screen.show(image.cv2image(frame_bgr if latest_overlay is None else latest_overlay, bgr=True, copy=False))
 
 

@@ -42,7 +42,9 @@ cd /root/app1
 python3 main.py
 ```
 
-短按设备按键采集一帧并只求解一次，串口打印一行 JSON，屏幕保留带红色抓取点、洋红色黑边目标点和旋转箭头的结果。按键时长不小于 `800 ms` 时仅保存 `/root/app1/calibration.jpg`，不会触发求解。
+程序启动后会自动连续识别和预测，不需要短按按键。首次得到 `status: "OK"` 后会定格当前识别结果，保存 `/root/app1/solution.jpg` 和 `/root/app1/solution.json`，并在屏幕上保留带 A4 边框、中线、源区轮廓、预测矩形、碎片编号、几何中心坐标和旋转角度的标注图。短按按键可清除定格并重新进入自动识别；按键时长不小于 `800 ms` 时仅保存 `/root/app1/calibration.jpg`，不会触发求解。
+
+`solution.json` 使用 A4 左上角作为坐标零点，单位为毫米，X 轴向右、Y 轴向下。下位机可优先读取其中的 `pieces` 数组：每片包含源区几何中心 `source_center_*_mm`、预测矩形内几何中心 `target_center_*_mm`、抓取点 `pick_*_mm`、放置点 `place_*_mm` 和旋转角 `rotation_deg`。
 
 ## 状态和动作边界
 
