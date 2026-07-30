@@ -52,6 +52,14 @@ class PartialSeamCandidate:
 
 
 @dataclass(frozen=True)
+class _ConstrainedFitSeed:
+    transforms: dict[int, RigidTransform2D]
+    seams: tuple[SeamCandidate, ...]
+    partial: PartialSeamCandidate
+    priority: float
+
+
+@dataclass(frozen=True)
 class _PartialState:
     transforms: dict[int, RigidTransform2D]
     used_intervals: dict[tuple[int, int], tuple[tuple[float, float], ...]]
@@ -64,6 +72,10 @@ _MAX_SOURCE_EDGES_PER_TARGET = 4
 _EQUIVALENT_LAYOUT_POSITION_MM = 20.0
 _EQUIVALENT_LAYOUT_ANGLE_RAD = math.radians(5.0)
 _FAST_SKELETON_STATE_LIMIT = 20
+_GLOBAL_FIT_SEED_LIMIT = 8
+_GLOBAL_FIT_STEPS = ((2.0, 2.0), (1.0, 1.0))
+_GLOBAL_FIT_MAX_SHIFT_MM = math.sqrt(18.0)
+_GLOBAL_FIT_MAX_ANGLE_RAD = math.radians(3.0)
 
 
 def _cross(edge: tuple[tuple[float, float], tuple[float, float]], point: tuple[float, float]) -> float:
@@ -408,6 +420,264 @@ def _score_transforms(
     return score, (long_side, short_side), fill_ratio
 
 
+def _partial_seam_residual(
+    candidate: PartialSeamCandidate,
+    transforms: dict[int, RigidTransform2D],
+    pieces_by_id: dict[int, PieceObservation],
+) -> float:
+    first_edge = apply_transform_polygon(
+        polygon_edges(pieces_by_id[candidate.piece_a].polygon_mm)[candidate.edge_a],
+        transforms[candidate.piece_a],
+    )
+    second_edge = apply_transform_polygon(
+        polygon_edges(pieces_by_id[candidate.piece_b].polygon_mm)[candidate.edge_b],
+        transforms[candidate.piece_b],
+    )
+    first_start = _interpolate(first_edge, candidate.interval_a[0])
+    first_end = _interpolate(first_edge, candidate.interval_a[1])
+    second_start = _interpolate(second_edge, candidate.interval_b[0])
+    second_end = _interpolate(second_edge, candidate.interval_b[1])
+    return (math.dist(first_start, second_end) + math.dist(first_end, second_start)) / 2.0
+
+
+def _global_fit_residual(
+    transforms: dict[int, RigidTransform2D],
+    seams: tuple[SeamCandidate, ...],
+    partial: PartialSeamCandidate,
+    pieces_by_id: dict[int, PieceObservation],
+) -> float:
+    residuals: list[float] = []
+    for seam in seams:
+        first_edge = polygon_edges(pieces_by_id[seam.piece_a].polygon_mm)[seam.edge_a]
+        second_edge = polygon_edges(pieces_by_id[seam.piece_b].polygon_mm)[seam.edge_b]
+        first_start, first_end = apply_transform_polygon(first_edge, transforms[seam.piece_a])
+        second_start, second_end = apply_transform_polygon(second_edge, transforms[seam.piece_b])
+        residuals.extend((math.dist(first_start, second_end), math.dist(first_end, second_start)))
+    residuals.extend((_partial_seam_residual(partial, transforms, pieces_by_id),) * 2)
+    return sum(residuals) / max(len(residuals), 1)
+
+
+def _global_fit_metrics(
+    transforms: dict[int, RigidTransform2D],
+    seams: tuple[SeamCandidate, ...],
+    partial: PartialSeamCandidate,
+    pieces_by_id: dict[int, PieceObservation],
+    config: SolverConfig,
+) -> tuple[float, tuple[float, float], float, float, float] | None:
+    polygons = tuple(
+        apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+        for piece_id, transform in transforms.items()
+    )
+    width, height, _ = _minimum_rectangle(polygons)
+    if not _has_usable_rectangle_size(width, height, config):
+        return None
+    rectangle_area = width * height
+    if rectangle_area <= 1e-6:
+        return None
+    areas = tuple(abs(polygon_signed_area(polygon)) for polygon in polygons)
+    total_area = sum(areas)
+    fill_ratio = total_area / rectangle_area
+    overlap = sum(
+        polygon_intersection_area(first, second) for first, second in combinations(polygons, 2)
+    )
+    residual = _global_fit_residual(transforms, seams, partial, pieces_by_id)
+    short_side, long_side = sorted((width, height))
+    objective = rectangle_area + 40.0 * overlap + 100.0 * residual
+    return objective, (long_side, short_side), fill_ratio, overlap, residual
+
+
+def _wrapped_angle_delta(first: float, second: float) -> float:
+    return (first - second + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _nudge_piece_pose(
+    piece: PieceObservation,
+    current: RigidTransform2D,
+    seed: RigidTransform2D,
+    dx_mm: float,
+    dy_mm: float,
+    delta_angle_rad: float,
+) -> RigidTransform2D | None:
+    angle = current.angle_rad + delta_angle_rad
+    if abs(_wrapped_angle_delta(angle, seed.angle_rad)) > _GLOBAL_FIT_MAX_ANGLE_RAD + 1e-9:
+        return None
+    current_center = apply_transform_polygon((piece.centroid_mm,), current)[0]
+    rotated_centroid = rotate_point(piece.centroid_mm, angle)
+    candidate = RigidTransform2D(
+        angle,
+        current_center[0] + dx_mm - rotated_centroid[0],
+        current_center[1] + dy_mm - rotated_centroid[1],
+    )
+    seed_center = apply_transform_polygon((piece.centroid_mm,), seed)[0]
+    candidate_center = apply_transform_polygon((piece.centroid_mm,), candidate)[0]
+    if math.dist(seed_center, candidate_center) > _GLOBAL_FIT_MAX_SHIFT_MM + 1e-9:
+        return None
+    return candidate
+
+
+def _fit_seed_transforms(
+    seed: _ConstrainedFitSeed,
+    pieces_by_id: dict[int, PieceObservation],
+    config: SolverConfig,
+) -> tuple[dict[int, RigidTransform2D], tuple[float, tuple[float, float], float, float, float]] | None:
+    transforms = dict(seed.transforms)
+    anchor_id = min(transforms)
+    for translation_step_mm, angle_step_deg in _GLOBAL_FIT_STEPS:
+        for piece_id in sorted(piece_id for piece_id in transforms if piece_id != anchor_id):
+            current = transforms[piece_id]
+            best = current
+            best_metrics = _global_fit_metrics(
+                transforms, seed.seams, seed.partial, pieces_by_id, config
+            )
+            if best_metrics is None:
+                continue
+            for dx_mm, dy_mm, angle_deg in product(
+                (-translation_step_mm, 0.0, translation_step_mm),
+                (-translation_step_mm, 0.0, translation_step_mm),
+                (-angle_step_deg, 0.0, angle_step_deg),
+            ):
+                candidate = _nudge_piece_pose(
+                    pieces_by_id[piece_id],
+                    current,
+                    seed.transforms[piece_id],
+                    dx_mm,
+                    dy_mm,
+                    math.radians(angle_deg),
+                )
+                if candidate is None:
+                    continue
+                transforms[piece_id] = candidate
+                candidate_metrics = _global_fit_metrics(
+                    transforms, seed.seams, seed.partial, pieces_by_id, config
+                )
+                if candidate_metrics is not None and candidate_metrics[0] < best_metrics[0] - 1e-9:
+                    best = candidate
+                    best_metrics = candidate_metrics
+            transforms[piece_id] = best
+    metrics = _global_fit_metrics(transforms, seed.seams, seed.partial, pieces_by_id, config)
+    return None if metrics is None else transforms, metrics
+
+
+def _global_fit_seed_priority(
+    transforms: dict[int, RigidTransform2D],
+    seams: tuple[SeamCandidate, ...],
+    partial: PartialSeamCandidate,
+    pieces_by_id: dict[int, PieceObservation],
+    config: SolverConfig,
+) -> float | None:
+    polygons = tuple(
+        apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+        for piece_id, transform in transforms.items()
+    )
+    points = tuple(point for polygon in polygons for point in polygon)
+    if not points:
+        return None
+    angles = []
+    for seam in seams:
+        edge = apply_transform_polygon(
+            polygon_edges(pieces_by_id[seam.piece_a].polygon_mm)[seam.edge_a],
+            transforms[seam.piece_a],
+        )
+        angles.append(math.atan2(edge[1][1] - edge[0][1], edge[1][0] - edge[0][0]))
+    partial_edge = apply_transform_polygon(
+        polygon_edges(pieces_by_id[partial.piece_a].polygon_mm)[partial.edge_a],
+        transforms[partial.piece_a],
+    )
+    angles.append(
+        math.atan2(
+            partial_edge[1][1] - partial_edge[0][1],
+            partial_edge[1][0] - partial_edge[0][0],
+        )
+    )
+    rectangle_areas = []
+    for angle in angles:
+        rotated = tuple(rotate_point(point, -angle) for point in points)
+        width = max(point[0] for point in rotated) - min(point[0] for point in rotated)
+        height = max(point[1] for point in rotated) - min(point[1] for point in rotated)
+        if _has_usable_rectangle_size(width, height, config):
+            rectangle_areas.append(width * height)
+    if not rectangle_areas:
+        return None
+    return (
+        min(rectangle_areas)
+        + 100.0 * sum(seam.length_error_mm for seam in seams)
+        + 20.0 * partial.length_gap_ratio
+    )
+
+
+def _solve_constrained_global_fit(
+    seeds: tuple[_ConstrainedFitSeed, ...],
+    pieces_by_id: dict[int, PieceObservation],
+    config: SolverConfig,
+) -> AssemblyResult | None:
+    if not seeds:
+        return None
+    minimum_fill_ratio = max(0.90, config.min_rectangle_fill_ratio - 0.04)
+    layouts: dict[
+        tuple[tuple[int, float, float, float], ...],
+        tuple[float, dict[int, RigidTransform2D], tuple[float, float], float, float],
+    ] = {}
+    attempts = 0
+    best_residual: float | None = None
+    for seed in sorted(seeds, key=lambda candidate: candidate.priority)[:_GLOBAL_FIT_SEED_LIMIT]:
+        attempts += 1
+        fitted = _fit_seed_transforms(seed, pieces_by_id, config)
+        if fitted is None:
+            continue
+        transforms, metrics = fitted
+        _objective, rectangle_size, fill_ratio, overlap, residual = metrics
+        best_residual = residual if best_residual is None else min(best_residual, residual)
+        polygons = tuple(
+            apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+            for piece_id, transform in transforms.items()
+        )
+        areas = tuple(abs(polygon_signed_area(polygon)) for polygon in polygons)
+        allowed_overlap = max(config.max_overlap_ratio, 0.02) * min(areas)
+        if (
+            fill_ratio < minimum_fill_ratio
+            or overlap > allowed_overlap + 1e-6
+            or residual > config.max_seam_residual_mm + 1e-6
+        ):
+            continue
+        score = (
+            (1.0 - min(fill_ratio, 1.0))
+            + overlap / max(sum(areas), 1e-6)
+            + residual / 100.0
+            + 0.02 * seed.partial.length_gap_ratio
+        )
+        signature = _layout_cluster_signature(transforms)
+        entry = (score, transforms, rectangle_size, fill_ratio, residual)
+        if signature not in layouts or entry[0] < layouts[signature][0]:
+            layouts[signature] = entry
+    diagnostics = {
+        "strategy": "constrained_global_rigid_fit",
+        "seed_count": min(len(seeds), _GLOBAL_FIT_SEED_LIMIT),
+        "fit_attempt_count": attempts,
+        "accepted_layout_count": len(layouts),
+        "best_seam_residual_mm": best_residual,
+    }
+    if not layouts:
+        return AssemblyResult(SolveStatus.NO_RECTANGLE_SOLUTION, diagnostics=diagnostics)
+    ranked = sorted(layouts.values(), key=lambda entry: entry[0])
+    best = ranked[0]
+    diagnostics["best_score"] = best[0]
+    if len(ranked) > 1:
+        diagnostics["second_score"] = ranked[1][0]
+        close_layouts = tuple(
+            entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
+        )
+        if any(not _layouts_are_equivalent(best[1], entry[1]) for entry in close_layouts):
+            return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
+    return AssemblyResult(
+        SolveStatus.OK,
+        transforms=best[1],
+        rectangle_size_mm=best[2],
+        fill_ratio=best[3],
+        score=best[0],
+        diagnostics=diagnostics,
+    )
+
+
 def _minimum_rectangle_area(
     transforms: dict[int, RigidTransform2D],
     pieces_by_id: dict[int, PieceObservation],
@@ -548,6 +818,7 @@ def _solve_skeleton_gap_layout(
     pieces: tuple[PieceObservation, ...],
     config: SolverConfig,
     state_limit: int | None = None,
+    enable_global_fit: bool = True,
 ) -> AssemblyResult | None:
     """Attach one partial-edge piece to a connected whole-edge skeleton."""
     if len(pieces) < 3:
@@ -623,6 +894,7 @@ def _solve_skeleton_gap_layout(
     for candidate in partial_candidates:
         partial_by_target[candidate.piece_a] = partial_by_target.get(candidate.piece_a, ()) + (candidate,)
     layouts: dict[tuple[tuple[int, float, float, float], ...], tuple[float, dict[int, RigidTransform2D], tuple[float, float], float]] = {}
+    fit_seeds: list[_ConstrainedFitSeed] = []
     pruned_overlap = 0
     for skeleton in skeletons:
         remaining_id = next(piece.piece_id for piece in pieces if piece.piece_id not in skeleton.transforms)
@@ -640,6 +912,24 @@ def _solve_skeleton_gap_layout(
                 ):
                     continue
                 source_transform = compose(target_transform, candidate.transform_b_to_a)
+                transforms = {**skeleton.transforms, remaining_id: source_transform}
+                if enable_global_fit:
+                    priority = _global_fit_seed_priority(
+                        transforms,
+                        skeleton.seams,
+                        candidate,
+                        pieces_by_id,
+                        config,
+                    )
+                    if priority is not None:
+                        fit_seeds.append(
+                            _ConstrainedFitSeed(
+                                transforms,
+                                skeleton.seams,
+                                candidate,
+                                priority,
+                            )
+                        )
                 source_polygon = apply_transform_polygon(pieces_by_id[remaining_id].polygon_mm, source_transform)
                 collision = False
                 for existing_id, existing_polygon in placed_polygons.items():
@@ -655,7 +945,6 @@ def _solve_skeleton_gap_layout(
                 if collision:
                     pruned_overlap += 1
                     continue
-                transforms = {**skeleton.transforms, remaining_id: source_transform}
                 scored = _score_transforms(
                     transforms,
                     pieces_by_id,
@@ -681,6 +970,15 @@ def _solve_skeleton_gap_layout(
         "pruned_overlap": pruned_overlap,
     }
     if not layouts:
+        constrained = (
+            _solve_constrained_global_fit(tuple(fit_seeds), pieces_by_id, config)
+            if enable_global_fit
+            else None
+        )
+        if constrained is not None and constrained.status is not SolveStatus.NO_RECTANGLE_SOLUTION:
+            return constrained
+        if constrained is not None:
+            diagnostics["constrained_global_fit"] = constrained.diagnostics
         return AssemblyResult(SolveStatus.NO_RECTANGLE_SOLUTION, diagnostics=diagnostics)
     ranked = sorted(layouts.values(), key=lambda entry: entry[0])
     best = ranked[0]
@@ -722,14 +1020,36 @@ def _solve_skeleton_gap_with_retry(
 ) -> AssemblyResult | None:
     full_limit = min(config.max_states, 800)
     fast_limit = min(full_limit, _FAST_SKELETON_STATE_LIMIT)
-    fast = _solve_skeleton_gap_layout(pieces, config, state_limit=fast_limit)
+    fast = _solve_skeleton_gap_layout(
+        pieces,
+        config,
+        state_limit=fast_limit,
+        enable_global_fit=False,
+    )
     if fast is not None and fast.status is SolveStatus.OK:
         return _with_skeleton_state_limits(fast, (fast_limit,))
     if fast_limit >= full_limit:
-        return None if fast is None else _with_skeleton_state_limits(fast, (fast_limit,))
+        final = _solve_skeleton_gap_layout(
+            pieces,
+            config,
+            state_limit=fast_limit,
+            enable_global_fit=True,
+        )
+        return None if final is None else _with_skeleton_state_limits(final, (fast_limit,))
     if fast is not None and not fast.diagnostics["state_limit_reached"]:
-        return _with_skeleton_state_limits(fast, (fast_limit,))
-    full = _solve_skeleton_gap_layout(pieces, config, state_limit=full_limit)
+        final = _solve_skeleton_gap_layout(
+            pieces,
+            config,
+            state_limit=fast_limit,
+            enable_global_fit=True,
+        )
+        return None if final is None else _with_skeleton_state_limits(final, (fast_limit,))
+    full = _solve_skeleton_gap_layout(
+        pieces,
+        config,
+        state_limit=full_limit,
+        enable_global_fit=True,
+    )
     if full is None:
         return None if fast is None else _with_skeleton_state_limits(fast, (fast_limit,))
     return _with_skeleton_state_limits(full, (fast_limit, full_limit))
