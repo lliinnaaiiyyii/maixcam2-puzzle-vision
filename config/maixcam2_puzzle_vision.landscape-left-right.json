@@ -28,6 +28,8 @@
     "max_overlap_ratio": 0.01,
     "min_rectangle_fill_ratio": 0.94,
     "ambiguity_margin": 0.08,
+    "allow_multiple_valid_rectangles": true,
+    "early_accept_valid_layout_count": 4,
     "max_states": 1200,
     "max_seam_residual_mm": 2.5,
     "pattern_margin": 0.03,

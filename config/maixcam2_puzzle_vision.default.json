@@ -23,6 +23,8 @@
     "min_edge_mm": 20.0
   },
   "solver": {
+    "allow_multiple_valid_rectangles": true,
+    "early_accept_valid_layout_count": 4,
     "min_confidence": 0.75
   },
   "pattern": {}

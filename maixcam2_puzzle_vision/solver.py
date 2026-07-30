@@ -78,6 +78,8 @@ _INTERCHANGEABLE_AREA_TOLERANCE_RATIO = 0.15
 _INTERCHANGEABLE_ANGLE_TOLERANCE_RAD = math.radians(10.0)
 _INTERCHANGEABLE_DOMINANCE_RATIO = 0.60
 _FAST_SKELETON_STATE_LIMIT = 20
+_EARLY_SKELETON_BATCH_SIZE = 1
+_STRICT_SKELETON_STATE_LIMIT = 80
 _GLOBAL_FIT_SEED_LIMIT = 8
 _GLOBAL_FIT_STEPS = ((2.0, 2.0), (1.0, 1.0))
 _GLOBAL_FIT_MAX_SHIFT_MM = math.sqrt(18.0)
@@ -513,6 +515,27 @@ def _has_dominant_interchangeable_cluster(
     return equivalent_count / max(close_count, 1) >= _INTERCHANGEABLE_DOMINANCE_RATIO, equivalent_count, close_count
 
 
+def _ranked_layout_ambiguity_is_acceptable(
+    best: dict[int, RigidTransform2D],
+    close: tuple[dict[int, RigidTransform2D], ...],
+    pieces_by_id: dict[int, PieceObservation],
+    config: SolverConfig,
+) -> tuple[bool, dict[str, bool | int]]:
+    accepted, equivalent_count, close_count = _has_dominant_interchangeable_cluster(best, close, pieces_by_id)
+    diagnostics = {
+        "equivalent_layout_count": equivalent_count,
+        "close_layout_count": close_count,
+        "interchangeable_equivalent_majority": accepted,
+        "multiple_valid_rectangles_accepted": False,
+    }
+    if accepted:
+        return True, diagnostics
+    if config.allow_multiple_valid_rectangles:
+        diagnostics["multiple_valid_rectangles_accepted"] = True
+        return True, diagnostics
+    return False, diagnostics
+
+
 def _score_transforms(
     transforms: dict[int, RigidTransform2D],
     pieces_by_id: dict[int, PieceObservation],
@@ -793,14 +816,13 @@ def _solve_constrained_global_fit(
         close_layouts = tuple(
             entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
         )
-        accepted, equivalent_count, close_count = _has_dominant_interchangeable_cluster(
+        accepted, ambiguity_diagnostics = _ranked_layout_ambiguity_is_acceptable(
             best[1],
             tuple(entry[1] for entry in close_layouts),
             pieces_by_id,
+            config,
         )
-        diagnostics["equivalent_layout_count"] = equivalent_count
-        diagnostics["close_layout_count"] = close_count
-        diagnostics["interchangeable_equivalent_majority"] = accepted
+        diagnostics.update(ambiguity_diagnostics)
         if not accepted:
             return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
@@ -937,7 +959,21 @@ def _solve_segmented_anchor_layout(
     }
     if len(candidates) > 1:
         diagnostics["second_score"] = candidates[1][0]
-        if candidates[1][0] - best[0] < config.ambiguity_margin:
+        close_layouts = tuple(candidate for candidate in candidates[1:] if candidate[0] - best[0] < config.ambiguity_margin)
+        if close_layouts:
+            pieces_by_id = {piece.piece_id: piece for piece in pieces}
+            accepted, ambiguity_diagnostics = _ranked_layout_ambiguity_is_acceptable(
+                best[1],
+                tuple(candidate[1] for candidate in close_layouts),
+                pieces_by_id,
+                config,
+            )
+            diagnostics.update(ambiguity_diagnostics)
+            if accepted:
+                diagnostics["accepted_ambiguous_strategy"] = "segmented_triangle_anchor"
+            else:
+                return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
+        if close_layouts and not diagnostics.get("multiple_valid_rectangles_accepted") and not diagnostics.get("interchangeable_equivalent_majority"):
             return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
         SolveStatus.OK,
@@ -954,84 +990,54 @@ def _solve_skeleton_gap_layout(
     config: SolverConfig,
     state_limit: int | None = None,
     enable_global_fit: bool = True,
+    relaxed_skeleton: bool = True,
 ) -> AssemblyResult | None:
     """Attach one partial-edge piece to a connected whole-edge skeleton."""
     if len(pieces) < 3:
         return None
     pieces_by_id = {piece.piece_id: piece for piece in pieces}
-    skeleton_config = replace(
-        config,
-        edge_length_tolerance_mm=max(config.edge_length_tolerance_mm, 4.0),
-        edge_length_tolerance_ratio=max(config.edge_length_tolerance_ratio, 0.12),
+    skeleton_config = (
+        replace(
+            config,
+            edge_length_tolerance_mm=max(config.edge_length_tolerance_mm, 4.0),
+            edge_length_tolerance_ratio=max(config.edge_length_tolerance_ratio, 0.12),
+        )
+        if relaxed_skeleton
+        else config
     )
     full_candidates = build_seam_candidates(pieces, skeleton_config)
     partial_candidates = build_partial_seam_candidates(pieces, config)
     if not full_candidates or not partial_candidates:
         return None
     by_target: dict[int, tuple[SeamCandidate, ...]] = {}
-    for candidate in full_candidates:
+    for candidate in sorted(
+        full_candidates,
+        key=lambda entry: (
+            entry.length_error_mm,
+            entry.piece_a,
+            entry.edge_a,
+            entry.piece_b,
+            entry.edge_b,
+        ),
+    ):
         by_target[candidate.piece_a] = by_target.get(candidate.piece_a, ()) + (candidate,)
 
     skeletons: list[_State] = []
     seen: set[tuple[tuple[int, float, float, float], ...]] = set()
     states_visited = 0
     effective_state_limit = min(config.max_states, 800 if state_limit is None else state_limit)
-
-    def search(state: _State) -> None:
-        nonlocal states_visited
-        if states_visited >= effective_state_limit:
-            return
-        states_visited += 1
-        if len(state.transforms) == len(pieces) - 1:
-            signature = _transforms_signature(state.transforms)
-            if signature not in seen:
-                seen.add(signature)
-                skeletons.append(state)
-            return
-        for target_id, target_transform in tuple(state.transforms.items()):
-            for candidate in by_target.get(target_id, ()):
-                if (
-                    candidate.piece_b in state.transforms
-                    or (candidate.piece_a, candidate.edge_a) in state.used_edges
-                    or (candidate.piece_b, candidate.edge_b) in state.used_edges
-                ):
-                    continue
-                source_transform = compose(target_transform, candidate.transform_b_to_a)
-                source_polygon = apply_transform_polygon(pieces_by_id[candidate.piece_b].polygon_mm, source_transform)
-                if any(
-                    polygon_intersection_area(
-                        source_polygon,
-                        apply_transform_polygon(pieces_by_id[existing_id].polygon_mm, existing_transform),
-                    )
-                    > config.max_overlap_ratio
-                    * min(
-                        abs(polygon_signed_area(source_polygon)),
-                        abs(polygon_signed_area(pieces_by_id[existing_id].polygon_mm)),
-                    )
-                    + 1e-6
-                    for existing_id, existing_transform in state.transforms.items()
-                ):
-                    continue
-                search(
-                    _State(
-                        {**state.transforms, candidate.piece_b: source_transform},
-                        state.used_edges | {(candidate.piece_a, candidate.edge_a), (candidate.piece_b, candidate.edge_b)},
-                        state.seams + (candidate,),
-                    )
-                )
-
-    for root in pieces:
-        search(_State({root.piece_id: RigidTransform2D()}, frozenset(), ()))
-    if not skeletons:
-        return None
-
     partial_by_target: dict[int, tuple[PartialSeamCandidate, ...]] = {}
     for candidate in partial_candidates:
         partial_by_target[candidate.piece_a] = partial_by_target.get(candidate.piece_a, ()) + (candidate,)
     layouts: dict[tuple[tuple[int, float, float, float], ...], tuple[float, dict[int, RigidTransform2D], tuple[float, float], float]] = {}
     fit_seeds: list[_ConstrainedFitSeed] = []
     pruned_overlap = 0
-    for skeleton in skeletons:
+    processed_skeleton_count = 0
+    early_accept_triggered = False
+    early_accept_target = config.early_accept_valid_layout_count if config.allow_multiple_valid_rectangles else 0
+
+    def score_skeleton(skeleton: _State) -> None:
+        nonlocal pruned_overlap
         remaining_id = next(piece.piece_id for piece in pieces if piece.piece_id not in skeleton.transforms)
         placed_polygons = {
             piece_id: apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
@@ -1093,6 +1099,70 @@ def _solve_skeleton_gap_layout(
                 entry = (scored[0], transforms, scored[1], scored[2])
                 if signature not in layouts or entry[0] < layouts[signature][0]:
                     layouts[signature] = entry
+
+    def score_pending_skeletons() -> None:
+        nonlocal processed_skeleton_count
+        for skeleton in skeletons[processed_skeleton_count:]:
+            score_skeleton(skeleton)
+        processed_skeleton_count = len(skeletons)
+
+    def search(state: _State) -> None:
+        nonlocal states_visited, early_accept_triggered
+        if early_accept_triggered or states_visited >= effective_state_limit:
+            return
+        states_visited += 1
+        if len(state.transforms) == len(pieces) - 1:
+            signature = _transforms_signature(state.transforms)
+            if signature not in seen:
+                seen.add(signature)
+                skeletons.append(state)
+                if (
+                    early_accept_target > 0
+                    and len(skeletons) - processed_skeleton_count >= _EARLY_SKELETON_BATCH_SIZE
+                ):
+                    score_pending_skeletons()
+                    if len(layouts) >= early_accept_target:
+                        early_accept_triggered = True
+            return
+        for target_id, target_transform in tuple(state.transforms.items()):
+            for candidate in by_target.get(target_id, ()):
+                if (
+                    candidate.piece_b in state.transforms
+                    or (candidate.piece_a, candidate.edge_a) in state.used_edges
+                    or (candidate.piece_b, candidate.edge_b) in state.used_edges
+                ):
+                    continue
+                source_transform = compose(target_transform, candidate.transform_b_to_a)
+                source_polygon = apply_transform_polygon(pieces_by_id[candidate.piece_b].polygon_mm, source_transform)
+                if any(
+                    polygon_intersection_area(
+                        source_polygon,
+                        apply_transform_polygon(pieces_by_id[existing_id].polygon_mm, existing_transform),
+                    )
+                    > config.max_overlap_ratio
+                    * min(
+                        abs(polygon_signed_area(source_polygon)),
+                        abs(polygon_signed_area(pieces_by_id[existing_id].polygon_mm)),
+                    )
+                    + 1e-6
+                    for existing_id, existing_transform in state.transforms.items()
+                ):
+                    continue
+                search(
+                    _State(
+                        {**state.transforms, candidate.piece_b: source_transform},
+                        state.used_edges | {(candidate.piece_a, candidate.edge_a), (candidate.piece_b, candidate.edge_b)},
+                        state.seams + (candidate,),
+                    )
+                )
+
+    for root in sorted(pieces, key=lambda piece: (len(by_target.get(piece.piece_id, ())), piece.piece_id)):
+        search(_State({root.piece_id: RigidTransform2D()}, frozenset(), ()))
+        if early_accept_triggered:
+            break
+    if not skeletons:
+        return None
+    score_pending_skeletons()
     diagnostics = {
         "strategy": "whole_edge_skeleton_plus_partial_gap",
         "candidate_count": len(full_candidates) + len(partial_candidates),
@@ -1103,6 +1173,7 @@ def _solve_skeleton_gap_layout(
         "state_limit_reached": states_visited >= effective_state_limit,
         "valid_layout_count": len(layouts),
         "pruned_overlap": pruned_overlap,
+        "early_accept_triggered": early_accept_triggered,
     }
     if not layouts:
         constrained = (
@@ -1123,14 +1194,13 @@ def _solve_skeleton_gap_layout(
         close_layouts = tuple(
             entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
         )
-        accepted, equivalent_layout_count, close_layout_count = _has_dominant_interchangeable_cluster(
+        accepted, ambiguity_diagnostics = _ranked_layout_ambiguity_is_acceptable(
             best[1],
             tuple(entry[1] for entry in close_layouts),
             pieces_by_id,
+            config,
         )
-        diagnostics["equivalent_layout_count"] = equivalent_layout_count
-        diagnostics["close_layout_count"] = close_layout_count
-        diagnostics["interchangeable_equivalent_majority"] = accepted
+        diagnostics.update(ambiguity_diagnostics)
         if not accepted:
             return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
@@ -1158,6 +1228,27 @@ def _solve_skeleton_gap_with_retry(
     config: SolverConfig,
 ) -> AssemblyResult | None:
     full_limit = min(config.max_states, 800)
+    if config.allow_multiple_valid_rectangles:
+        strict_limit = min(full_limit, _STRICT_SKELETON_STATE_LIMIT)
+        strict = _solve_skeleton_gap_layout(
+            pieces,
+            config,
+            state_limit=strict_limit,
+            enable_global_fit=False,
+            relaxed_skeleton=False,
+        )
+        if strict is not None and strict.status is SolveStatus.OK:
+            return _with_skeleton_state_limits(strict, (strict_limit,))
+        result = _solve_skeleton_gap_layout(
+            pieces,
+            config,
+            state_limit=full_limit,
+            enable_global_fit=True,
+            relaxed_skeleton=True,
+        )
+        if result is not None:
+            return _with_skeleton_state_limits(result, (strict_limit, full_limit))
+        return None if strict is None else _with_skeleton_state_limits(strict, (strict_limit,))
     fast_limit = min(full_limit, _FAST_SKELETON_STATE_LIMIT)
     fast = _solve_skeleton_gap_layout(
         pieces,
@@ -1317,8 +1408,19 @@ def _solve_partial_seam_layout(
     diagnostics["best_score"] = best[0]
     if len(ranked) > 1:
         diagnostics["second_score"] = ranked[1][0]
-        if ranked[1][0] - best[0] < config.ambiguity_margin:
-            return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
+        close_layouts = tuple(entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin)
+        if close_layouts:
+            accepted, ambiguity_diagnostics = _ranked_layout_ambiguity_is_acceptable(
+                best[1],
+                tuple(entry[1] for entry in close_layouts),
+                pieces_by_id,
+                config,
+            )
+            diagnostics.update(ambiguity_diagnostics)
+            if accepted:
+                diagnostics["accepted_ambiguous_strategy"] = "partial_seam"
+            else:
+                return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
         SolveStatus.OK,
         transforms=best[1],
@@ -1423,16 +1525,43 @@ def solve_layout(
     if len(ranked) > 1:
         diagnostics["second_score"] = ranked[1][0]
         if ranked[1][0] - best[0] < config.ambiguity_margin:
+            close_entries = [entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin]
             if pattern_scorer is None:
-                return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
-            close_layouts = [entry for entry in ranked if entry[0] - best[0] < config.ambiguity_margin]
-            texture_ranked = sorted((float(pattern_scorer(entry[1].transforms)), entry) for entry in close_layouts)
-            diagnostics["best_texture_score"] = texture_ranked[0][0]
-            if len(texture_ranked) > 1:
-                diagnostics["second_texture_score"] = texture_ranked[1][0]
-                if texture_ranked[1][0] - texture_ranked[0][0] < config.pattern_margin:
+                accepted, ambiguity_diagnostics = _ranked_layout_ambiguity_is_acceptable(
+                    best[1].transforms,
+                    tuple(entry[1].transforms for entry in close_entries),
+                    pieces_by_id,
+                    config,
+                )
+                diagnostics.update(ambiguity_diagnostics)
+                if accepted:
+                    diagnostics["accepted_ambiguous_strategy"] = "whole_edge"
+                else:
                     return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
-            best = texture_ranked[0][1]
+            else:
+                close_layouts = [best, *close_entries]
+                texture_ranked = sorted((float(pattern_scorer(entry[1].transforms)), entry) for entry in close_layouts)
+                diagnostics["best_texture_score"] = texture_ranked[0][0]
+                if len(texture_ranked) > 1:
+                    diagnostics["second_texture_score"] = texture_ranked[1][0]
+                    if texture_ranked[1][0] - texture_ranked[0][0] < config.pattern_margin:
+                        texture_close = tuple(
+                            entry[1].transforms
+                            for texture_score, entry in texture_ranked[1:]
+                            if texture_score - texture_ranked[0][0] < config.pattern_margin
+                        )
+                        accepted, ambiguity_diagnostics = _ranked_layout_ambiguity_is_acceptable(
+                            texture_ranked[0][1][1].transforms,
+                            texture_close,
+                            pieces_by_id,
+                            config,
+                        )
+                        diagnostics.update(ambiguity_diagnostics)
+                        if accepted:
+                            diagnostics["accepted_ambiguous_strategy"] = "texture_tie"
+                        else:
+                            return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
+                best = texture_ranked[0][1]
     return AssemblyResult(
         SolveStatus.OK,
         transforms=best[1].transforms,

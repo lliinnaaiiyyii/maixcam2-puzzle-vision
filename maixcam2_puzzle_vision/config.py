@@ -54,6 +54,8 @@ class SolverConfig:
     min_rectangle_fill_ratio: float = 0.94
     max_internal_hole_mm2: float = 25.0
     ambiguity_margin: float = 0.04
+    allow_multiple_valid_rectangles: bool = False
+    early_accept_valid_layout_count: int = 4
     max_states: int = 1200
     max_seam_residual_mm: float = 2.5
     pattern_margin: float = 0.03

@@ -1,7 +1,9 @@
+from maixcam2_puzzle_vision.config import SolverConfig
 from maixcam2_puzzle_vision.geometry import polygon_centroid
 from maixcam2_puzzle_vision.models import PieceObservation, RigidTransform2D
 from maixcam2_puzzle_vision.solver import (
     _has_dominant_interchangeable_cluster,
+    _ranked_layout_ambiguity_is_acceptable,
     _layouts_are_equivalent,
     _layouts_are_interchangeably_equivalent,
 )
@@ -95,3 +97,45 @@ def test_dominant_interchangeable_cluster_rejects_non_equivalent_majority() -> N
     assert accepted is False
     assert equivalent_count == 2
     assert close_count == 5
+
+
+def test_multiple_valid_rectangles_are_rejected_when_strict_mode_is_enabled() -> None:
+    pieces_by_id = {
+        0: _piece(0, ((0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0))),
+        1: _piece(1, ((40.0, 0.0), (70.0, 0.0), (70.0, 20.0), (40.0, 20.0))),
+        2: _piece(2, ((0.0, 40.0), (60.0, 40.0), (60.0, 60.0), (0.0, 60.0))),
+    }
+    best = {0: RigidTransform2D(), 1: RigidTransform2D(), 2: RigidTransform2D()}
+    non_equivalent = {0: RigidTransform2D(0.0, 0.0, 28.0), 1: RigidTransform2D(), 2: RigidTransform2D()}
+
+    accepted, diagnostics = _ranked_layout_ambiguity_is_acceptable(
+        best,
+        (non_equivalent,),
+        pieces_by_id,
+        SolverConfig(allow_multiple_valid_rectangles=False),
+    )
+
+    assert accepted is False
+    assert diagnostics["interchangeable_equivalent_majority"] is False
+    assert diagnostics["multiple_valid_rectangles_accepted"] is False
+
+
+def test_multiple_valid_rectangles_are_accepted_when_contest_mode_is_enabled() -> None:
+    pieces_by_id = {
+        0: _piece(0, ((0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0))),
+        1: _piece(1, ((40.0, 0.0), (70.0, 0.0), (70.0, 20.0), (40.0, 20.0))),
+        2: _piece(2, ((0.0, 40.0), (60.0, 40.0), (60.0, 60.0), (0.0, 60.0))),
+    }
+    best = {0: RigidTransform2D(), 1: RigidTransform2D(), 2: RigidTransform2D()}
+    non_equivalent = {0: RigidTransform2D(0.0, 0.0, 28.0), 1: RigidTransform2D(), 2: RigidTransform2D()}
+
+    accepted, diagnostics = _ranked_layout_ambiguity_is_acceptable(
+        best,
+        (non_equivalent,),
+        pieces_by_id,
+        SolverConfig(allow_multiple_valid_rectangles=True),
+    )
+
+    assert accepted is True
+    assert diagnostics["interchangeable_equivalent_majority"] is False
+    assert diagnostics["multiple_valid_rectangles_accepted"] is True
