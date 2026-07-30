@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import heapq
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations, permutations, product
 from typing import Callable
 
@@ -36,6 +37,30 @@ class _State:
     transforms: dict[int, RigidTransform2D]
     used_edges: frozenset[tuple[int, int]]
     seams: tuple[SeamCandidate, ...]
+
+
+@dataclass(frozen=True)
+class PartialSeamCandidate:
+    piece_a: int
+    edge_a: int
+    piece_b: int
+    edge_b: int
+    transform_b_to_a: RigidTransform2D
+    interval_a: tuple[float, float]
+    interval_b: tuple[float, float]
+    length_gap_ratio: float
+
+
+@dataclass(frozen=True)
+class _PartialState:
+    transforms: dict[int, RigidTransform2D]
+    used_intervals: dict[tuple[int, int], tuple[tuple[float, float], ...]]
+    penalty: float
+
+
+_PARTIAL_POSITIONS = (0.0, 0.25, 0.5, 0.75, 1.0)
+_MIN_PARTIAL_SEAM_RATIO = 0.15
+_MAX_SOURCE_EDGES_PER_TARGET = 4
 
 
 def _cross(edge: tuple[tuple[float, float], tuple[float, float]], point: tuple[float, float]) -> float:
@@ -84,6 +109,137 @@ def build_seam_candidates(pieces: tuple[PieceObservation, ...], config: SolverCo
                     )
                 )
     return tuple(candidates)
+
+
+def _interpolate(
+    edge: tuple[tuple[float, float], tuple[float, float]], fraction: float
+) -> tuple[float, float]:
+    start, end = edge
+    return (
+        start[0] + (end[0] - start[0]) * fraction,
+        start[1] + (end[1] - start[1]) * fraction,
+    )
+
+
+def _partial_alignment(
+    target_edge: tuple[tuple[float, float], tuple[float, float]],
+    target_start_fraction: float,
+    source_edge: tuple[tuple[float, float], tuple[float, float]],
+) -> RigidTransform2D:
+    target_length = edge_length(target_edge)
+    source_length = edge_length(source_edge)
+    source_start_fraction = target_start_fraction
+    source_end_fraction = source_start_fraction + source_length / max(target_length, 1e-6)
+    # A cut edge has opposite boundary directions in its two adjacent pieces.
+    return _align_edge_to_segment(
+        _interpolate(target_edge, source_end_fraction),
+        _interpolate(target_edge, source_start_fraction),
+        source_edge,
+    )
+
+
+def _select_partial_candidates(
+    candidates: list[PartialSeamCandidate],
+) -> tuple[PartialSeamCandidate, ...]:
+    """Keep a small, diverse set of source edges for every long target edge."""
+    grouped: dict[tuple[int, int, int], dict[int, list[PartialSeamCandidate]]] = {}
+    for candidate in candidates:
+        edge_groups = grouped.setdefault(
+            (candidate.piece_a, candidate.edge_a, candidate.piece_b),
+            {},
+        )
+        edge_groups.setdefault(candidate.edge_b, []).append(candidate)
+    selected: list[PartialSeamCandidate] = []
+    for edge_groups in grouped.values():
+        source_groups = sorted(
+            edge_groups.values(),
+            key=lambda group: (
+                group[0].length_gap_ratio,
+                -(
+                    group[0].interval_a[1]
+                    - group[0].interval_a[0]
+                ),
+            ),
+        )
+        for group in source_groups[:_MAX_SOURCE_EDGES_PER_TARGET]:
+            selected.extend(group)
+    return tuple(selected)
+
+
+def build_partial_seam_candidates(
+    pieces: tuple[PieceObservation, ...], config: SolverConfig
+) -> tuple[PartialSeamCandidate, ...]:
+    """Build bounded whole-edge and short-to-long shared-cut hypotheses."""
+    forward: list[PartialSeamCandidate] = []
+    for first, second in combinations(pieces, 2):
+        for first_index, first_edge in enumerate(polygon_edges(first.polygon_mm)):
+            first_length = edge_length(first_edge)
+            for second_index, second_edge in enumerate(polygon_edges(second.polygon_mm)):
+                second_length = edge_length(second_edge)
+                if first_length >= second_length:
+                    target, target_index, target_edge, target_length = first, first_index, first_edge, first_length
+                    source, source_index, source_edge, source_length = second, second_index, second_edge, second_length
+                else:
+                    target, target_index, target_edge, target_length = second, second_index, second_edge, second_length
+                    source, source_index, source_edge, source_length = first, first_index, first_edge, first_length
+                if source_length / max(target_length, 1e-6) < _MIN_PARTIAL_SEAM_RATIO:
+                    continue
+                is_whole_edge = _lengths_match(target_length, source_length, config)
+                positions = (0.0,) if is_whole_edge else _PARTIAL_POSITIONS
+                for position in positions:
+                    interval_start = position * (1.0 - source_length / target_length)
+                    interval_end = interval_start + source_length / target_length
+                    transform = _partial_alignment(target_edge, interval_start, source_edge)
+                    transformed_source = apply_transform_polygon(source.polygon_mm, transform)
+                    if not _opposite_sides(target_edge, target.polygon_mm, transformed_source):
+                        continue
+                    allowed_overlap = config.max_overlap_ratio * min(
+                        abs(polygon_signed_area(target.polygon_mm)),
+                        abs(polygon_signed_area(transformed_source)),
+                    )
+                    if polygon_intersection_area(target.polygon_mm, transformed_source) > allowed_overlap + 1e-6:
+                        continue
+                    forward.append(
+                        PartialSeamCandidate(
+                            target.piece_id,
+                            target_index,
+                            source.piece_id,
+                            source_index,
+                            transform,
+                            (interval_start, interval_end),
+                            (0.0, 1.0),
+                            0.0 if is_whole_edge else 1.0 - source_length / target_length,
+                        )
+                    )
+    selected = _select_partial_candidates(forward)
+    candidates: list[PartialSeamCandidate] = []
+    for candidate in selected:
+        candidates.append(candidate)
+        candidates.append(
+            PartialSeamCandidate(
+                candidate.piece_b,
+                candidate.edge_b,
+                candidate.piece_a,
+                candidate.edge_a,
+                inverse(candidate.transform_b_to_a),
+                candidate.interval_b,
+                candidate.interval_a,
+                candidate.length_gap_ratio,
+            )
+        )
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.length_gap_ratio,
+                candidate.piece_a,
+                candidate.edge_a,
+                candidate.piece_b,
+                candidate.edge_b,
+                candidate.interval_a,
+            ),
+        )
+    )
 
 
 def _minimum_rectangle(polygons: tuple[tuple[tuple[float, float], ...], ...]) -> tuple[float, float, float]:
@@ -154,6 +310,106 @@ def _layout_signature(state: _State) -> tuple[tuple[int, float, float, float], .
         angle = (relative.angle_rad + math.pi) % (2.0 * math.pi) - math.pi
         signature.append((piece_id, round(angle, 4), round(relative.tx_mm, 3), round(relative.ty_mm, 3)))
     return tuple(signature)
+
+
+def _transforms_signature(transforms: dict[int, RigidTransform2D]) -> tuple[tuple[int, float, float, float], ...]:
+    anchor_id = min(transforms)
+    anchor_inverse = inverse(transforms[anchor_id])
+    signature = []
+    for piece_id, transform in sorted(transforms.items()):
+        relative = compose(anchor_inverse, transform)
+        angle = (relative.angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+        signature.append((piece_id, round(angle, 3), round(relative.tx_mm, 1), round(relative.ty_mm, 1)))
+    return tuple(signature)
+
+
+def _layout_cluster_signature(
+    transforms: dict[int, RigidTransform2D],
+) -> tuple[tuple[int, float, float, float], ...]:
+    """Merge the same physical layout reached through different seam orders."""
+    anchor_id = min(transforms)
+    anchor_inverse = inverse(transforms[anchor_id])
+    signature = []
+    for piece_id, transform in sorted(transforms.items()):
+        relative = compose(anchor_inverse, transform)
+        angle = (relative.angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+        signature.append(
+            (
+                piece_id,
+                round(angle / math.radians(2.0)) * 2.0,
+                round(relative.tx_mm / 2.0) * 2.0,
+                round(relative.ty_mm / 2.0) * 2.0,
+            )
+        )
+    return tuple(signature)
+
+
+def _score_transforms(
+    transforms: dict[int, RigidTransform2D],
+    pieces_by_id: dict[int, PieceObservation],
+    config: SolverConfig,
+    seam_penalty: float = 0.0,
+    minimum_fill_ratio: float | None = None,
+) -> tuple[float, tuple[float, float], float] | None:
+    polygons = tuple(
+        apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+        for piece_id, transform in transforms.items()
+    )
+    width, height, _ = _minimum_rectangle(polygons)
+    short_side, long_side = sorted((width, height))
+    if not 50.0 <= short_side <= 90.0 or not 90.0 <= long_side <= 120.0:
+        return None
+    rectangle_area = width * height
+    if rectangle_area <= 1e-6:
+        return None
+    areas = [abs(polygon_signed_area(polygon)) for polygon in polygons]
+    total_area = sum(areas)
+    fill_ratio = total_area / rectangle_area
+    if fill_ratio < (config.min_rectangle_fill_ratio if minimum_fill_ratio is None else minimum_fill_ratio):
+        return None
+    overlap = sum(polygon_intersection_area(first, second) for first, second in combinations(polygons, 2))
+    if overlap > max(config.max_overlap_ratio, 0.02) * min(areas):
+        return None
+    score = (
+        (1.0 - min(fill_ratio, 1.0))
+        + overlap / max(total_area, 1e-6)
+        + 0.02 * seam_penalty
+    )
+    return score, (long_side, short_side), fill_ratio
+
+
+def _minimum_rectangle_area(
+    transforms: dict[int, RigidTransform2D],
+    pieces_by_id: dict[int, PieceObservation],
+) -> float:
+    polygons = tuple(
+        apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+        for piece_id, transform in transforms.items()
+    )
+    width, height, _ = _minimum_rectangle(polygons)
+    return width * height
+
+
+def _intervals_overlap(first: tuple[float, float], second: tuple[float, float]) -> bool:
+    return max(first[0], second[0]) < min(first[1], second[1]) - 1e-3
+
+
+def _interval_is_available(
+    used_intervals: dict[tuple[int, int], tuple[tuple[float, float], ...]],
+    key: tuple[int, int],
+    interval: tuple[float, float],
+) -> bool:
+    return not any(_intervals_overlap(interval, used) for used in used_intervals.get(key, ()))
+
+
+def _add_used_interval(
+    used_intervals: dict[tuple[int, int], tuple[tuple[float, float], ...]],
+    key: tuple[int, int],
+    interval: tuple[float, float],
+) -> dict[tuple[int, int], tuple[tuple[float, float], ...]]:
+    updated = dict(used_intervals)
+    updated[key] = updated.get(key, ()) + (interval,)
+    return updated
 
 
 def _align_edge_to_segment(
@@ -260,6 +516,294 @@ def _solve_segmented_anchor_layout(
     )
 
 
+def _solve_skeleton_gap_layout(
+    pieces: tuple[PieceObservation, ...],
+    config: SolverConfig,
+) -> AssemblyResult | None:
+    """Attach one partial-edge piece to a connected whole-edge skeleton."""
+    if len(pieces) < 3:
+        return None
+    pieces_by_id = {piece.piece_id: piece for piece in pieces}
+    skeleton_config = replace(
+        config,
+        edge_length_tolerance_mm=max(config.edge_length_tolerance_mm, 4.0),
+        edge_length_tolerance_ratio=max(config.edge_length_tolerance_ratio, 0.12),
+    )
+    full_candidates = build_seam_candidates(pieces, skeleton_config)
+    partial_candidates = build_partial_seam_candidates(pieces, config)
+    if not full_candidates or not partial_candidates:
+        return None
+    by_target: dict[int, tuple[SeamCandidate, ...]] = {}
+    for candidate in full_candidates:
+        by_target[candidate.piece_a] = by_target.get(candidate.piece_a, ()) + (candidate,)
+
+    skeletons: list[_State] = []
+    seen: set[tuple[tuple[int, float, float, float], ...]] = set()
+    states_visited = 0
+    state_limit = min(config.max_states, 800)
+
+    def search(state: _State) -> None:
+        nonlocal states_visited
+        if states_visited >= state_limit:
+            return
+        states_visited += 1
+        if len(state.transforms) == len(pieces) - 1:
+            signature = _transforms_signature(state.transforms)
+            if signature not in seen:
+                seen.add(signature)
+                skeletons.append(state)
+            return
+        for target_id, target_transform in tuple(state.transforms.items()):
+            for candidate in by_target.get(target_id, ()):
+                if (
+                    candidate.piece_b in state.transforms
+                    or (candidate.piece_a, candidate.edge_a) in state.used_edges
+                    or (candidate.piece_b, candidate.edge_b) in state.used_edges
+                ):
+                    continue
+                source_transform = compose(target_transform, candidate.transform_b_to_a)
+                source_polygon = apply_transform_polygon(pieces_by_id[candidate.piece_b].polygon_mm, source_transform)
+                if any(
+                    polygon_intersection_area(
+                        source_polygon,
+                        apply_transform_polygon(pieces_by_id[existing_id].polygon_mm, existing_transform),
+                    )
+                    > config.max_overlap_ratio
+                    * min(
+                        abs(polygon_signed_area(source_polygon)),
+                        abs(polygon_signed_area(pieces_by_id[existing_id].polygon_mm)),
+                    )
+                    + 1e-6
+                    for existing_id, existing_transform in state.transforms.items()
+                ):
+                    continue
+                search(
+                    _State(
+                        {**state.transforms, candidate.piece_b: source_transform},
+                        state.used_edges | {(candidate.piece_a, candidate.edge_a), (candidate.piece_b, candidate.edge_b)},
+                        state.seams + (candidate,),
+                    )
+                )
+
+    for root in pieces:
+        search(_State({root.piece_id: RigidTransform2D()}, frozenset(), ()))
+    if not skeletons:
+        return None
+
+    partial_by_target: dict[int, tuple[PartialSeamCandidate, ...]] = {}
+    for candidate in partial_candidates:
+        partial_by_target[candidate.piece_a] = partial_by_target.get(candidate.piece_a, ()) + (candidate,)
+    layouts: dict[tuple[tuple[int, float, float, float], ...], tuple[float, dict[int, RigidTransform2D], tuple[float, float], float]] = {}
+    pruned_overlap = 0
+    for skeleton in skeletons:
+        remaining_id = next(piece.piece_id for piece in pieces if piece.piece_id not in skeleton.transforms)
+        placed_polygons = {
+            piece_id: apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+            for piece_id, transform in skeleton.transforms.items()
+        }
+        for target_id, target_transform in skeleton.transforms.items():
+            for candidate in partial_by_target.get(target_id, ()):
+                if candidate.piece_b != remaining_id:
+                    continue
+                if (
+                    (candidate.piece_a, candidate.edge_a) in skeleton.used_edges
+                    or (candidate.piece_b, candidate.edge_b) in skeleton.used_edges
+                ):
+                    continue
+                source_transform = compose(target_transform, candidate.transform_b_to_a)
+                source_polygon = apply_transform_polygon(pieces_by_id[remaining_id].polygon_mm, source_transform)
+                collision = False
+                for existing_id, existing_polygon in placed_polygons.items():
+                    if existing_id == target_id:
+                        continue
+                    allowed_overlap = max(config.max_overlap_ratio, 0.02) * min(
+                        abs(polygon_signed_area(source_polygon)),
+                        abs(polygon_signed_area(existing_polygon)),
+                    )
+                    if polygon_intersection_area(source_polygon, existing_polygon) > allowed_overlap + 1e-6:
+                        collision = True
+                        break
+                if collision:
+                    pruned_overlap += 1
+                    continue
+                transforms = {**skeleton.transforms, remaining_id: source_transform}
+                scored = _score_transforms(
+                    transforms,
+                    pieces_by_id,
+                    config,
+                    candidate.length_gap_ratio,
+                    minimum_fill_ratio=max(0.90, config.min_rectangle_fill_ratio - 0.04),
+                )
+                if scored is None:
+                    continue
+                signature = _layout_cluster_signature(transforms)
+                entry = (scored[0], transforms, scored[1], scored[2])
+                if signature not in layouts or entry[0] < layouts[signature][0]:
+                    layouts[signature] = entry
+    diagnostics = {
+        "strategy": "whole_edge_skeleton_plus_partial_gap",
+        "candidate_count": len(full_candidates) + len(partial_candidates),
+        "skeleton_edge_tolerance_ratio": skeleton_config.edge_length_tolerance_ratio,
+        "skeleton_count": len(skeletons),
+        "states_visited": states_visited,
+        "state_limit_reached": states_visited >= state_limit,
+        "valid_layout_count": len(layouts),
+        "pruned_overlap": pruned_overlap,
+    }
+    if not layouts:
+        return AssemblyResult(SolveStatus.NO_RECTANGLE_SOLUTION, diagnostics=diagnostics)
+    ranked = sorted(layouts.values(), key=lambda entry: entry[0])
+    best = ranked[0]
+    diagnostics["best_score"] = best[0]
+    if len(ranked) > 1:
+        diagnostics["second_score"] = ranked[1][0]
+        if ranked[1][0] - best[0] < config.ambiguity_margin:
+            return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
+    return AssemblyResult(
+        SolveStatus.OK,
+        transforms=best[1],
+        rectangle_size_mm=best[2],
+        fill_ratio=best[3],
+        score=best[0],
+        diagnostics=diagnostics,
+    )
+
+
+def _solve_partial_seam_layout(
+    pieces: tuple[PieceObservation, ...],
+    config: SolverConfig,
+) -> AssemblyResult | None:
+    if len(pieces) < 2:
+        return None
+    pieces_by_id = {piece.piece_id: piece for piece in pieces}
+    candidates = build_partial_seam_candidates(pieces, config)
+    if not candidates:
+        return None
+    candidates_by_target: dict[int, tuple[PartialSeamCandidate, ...]] = {}
+    for candidate in candidates:
+        candidates_by_target[candidate.piece_a] = candidates_by_target.get(candidate.piece_a, ()) + (candidate,)
+
+    layouts: dict[tuple[tuple[int, float, float, float], ...], tuple[float, dict[int, RigidTransform2D], tuple[float, float], float]] = {}
+    queue: list[tuple[float, int, _PartialState]] = []
+    best_seen: dict[tuple[tuple[int, float, float, float], ...], float] = {}
+    push_index = 0
+    for root in pieces:
+        state = _PartialState({root.piece_id: RigidTransform2D()}, {}, 0.0)
+        best_seen[_transforms_signature(state.transforms)] = 0.0
+        heapq.heappush(queue, (0.0, push_index, state))
+        push_index += 1
+
+    states_visited = 0
+    state_limit_reached = False
+    pruned_overlap = 0
+    pruned_duplicate = 0
+    pruned_interval = 0
+    pruned_area = 0
+    total_area = sum(abs(polygon_signed_area(piece.polygon_mm)) for piece in pieces)
+    maximum_rectangle_area = total_area / max(config.min_rectangle_fill_ratio, 1e-6)
+    state_limit = min(config.max_states, 320)
+    while queue and states_visited < state_limit:
+        _priority, _tie_breaker, state = heapq.heappop(queue)
+        signature = _transforms_signature(state.transforms)
+        if state.penalty > best_seen.get(signature, float("inf")) + 1e-6:
+            pruned_duplicate += 1
+            continue
+        states_visited += 1
+        if len(state.transforms) == len(pieces):
+            scored = _score_transforms(state.transforms, pieces_by_id, config, state.penalty)
+            if scored is not None:
+                entry = (scored[0], state.transforms, scored[1], scored[2])
+                layout_signature = _layout_cluster_signature(state.transforms)
+                if layout_signature not in layouts or entry[0] < layouts[layout_signature][0]:
+                    layouts[layout_signature] = entry
+            continue
+
+        placed_polygons = {
+            piece_id: apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+            for piece_id, transform in state.transforms.items()
+        }
+        for target_id, target_transform in tuple(state.transforms.items()):
+            for candidate in candidates_by_target.get(target_id, ()):
+                source_id = candidate.piece_b
+                if source_id in state.transforms:
+                    continue
+                target_key = (candidate.piece_a, candidate.edge_a)
+                source_key = (candidate.piece_b, candidate.edge_b)
+                if not _interval_is_available(state.used_intervals, target_key, candidate.interval_a):
+                    pruned_interval += 1
+                    continue
+                if not _interval_is_available(state.used_intervals, source_key, candidate.interval_b):
+                    pruned_interval += 1
+                    continue
+                source_transform = compose(target_transform, candidate.transform_b_to_a)
+                source_polygon = apply_transform_polygon(pieces_by_id[source_id].polygon_mm, source_transform)
+                collision = False
+                for existing_id, existing_polygon in placed_polygons.items():
+                    if existing_id == target_id:
+                        continue
+                    allowed_overlap = max(config.max_overlap_ratio, 0.02) * min(
+                        abs(polygon_signed_area(source_polygon)),
+                        abs(polygon_signed_area(existing_polygon)),
+                    )
+                    if polygon_intersection_area(source_polygon, existing_polygon) > allowed_overlap + 1e-6:
+                        collision = True
+                        break
+                if collision:
+                    pruned_overlap += 1
+                    continue
+                used = _add_used_interval(state.used_intervals, target_key, candidate.interval_a)
+                used = _add_used_interval(used, source_key, candidate.interval_b)
+                updated_transforms = {**state.transforms, source_id: source_transform}
+                if _minimum_rectangle_area(updated_transforms, pieces_by_id) > maximum_rectangle_area:
+                    pruned_area += 1
+                    continue
+                penalty = state.penalty + candidate.length_gap_ratio
+                next_signature = _transforms_signature(updated_transforms)
+                if best_seen.get(next_signature, float("inf")) <= penalty + 1e-6:
+                    pruned_duplicate += 1
+                    continue
+                best_seen[next_signature] = penalty
+                heapq.heappush(
+                    queue,
+                    (
+                        penalty - 0.1 * len(updated_transforms),
+                        push_index,
+                        _PartialState(updated_transforms, used, penalty),
+                    ),
+                )
+                push_index += 1
+    if queue:
+        state_limit_reached = True
+    diagnostics = {
+        "strategy": "partial_seam",
+        "candidate_count": len(candidates),
+        "states_visited": states_visited,
+        "state_limit_reached": state_limit_reached,
+        "valid_layout_count": len(layouts),
+        "pruned_overlap": pruned_overlap,
+        "pruned_duplicate": pruned_duplicate,
+        "pruned_interval": pruned_interval,
+        "pruned_area": pruned_area,
+    }
+    if not layouts:
+        return AssemblyResult(SolveStatus.NO_RECTANGLE_SOLUTION, diagnostics=diagnostics)
+    ranked = sorted(layouts.values(), key=lambda entry: entry[0])
+    best = ranked[0]
+    diagnostics["best_score"] = best[0]
+    if len(ranked) > 1:
+        diagnostics["second_score"] = ranked[1][0]
+        if ranked[1][0] - best[0] < config.ambiguity_margin:
+            return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
+    return AssemblyResult(
+        SolveStatus.OK,
+        transforms=best[1],
+        rectangle_size_mm=best[2],
+        fill_ratio=best[3],
+        score=best[0],
+        diagnostics=diagnostics,
+    )
+
+
 def solve_layout(
     pieces: tuple[PieceObservation, ...],
     config: SolverConfig,
@@ -328,6 +872,25 @@ def solve_layout(
         segmented = _solve_segmented_anchor_layout(pieces, config)
         if segmented is not None:
             return segmented
+        skeleton_gap = _solve_skeleton_gap_layout(pieces, config)
+        if skeleton_gap is not None and skeleton_gap.status is not SolveStatus.NO_RECTANGLE_SOLUTION:
+            return skeleton_gap
+        if skeleton_gap is not None and skeleton_gap.diagnostics.get("skeleton_count", 0) > 0:
+            return AssemblyResult(
+                SolveStatus.NO_RECTANGLE_SOLUTION,
+                diagnostics={
+                    **diagnostics,
+                    "skeleton_gap": skeleton_gap.diagnostics,
+                    "reason": "whole_edge_skeleton_rejected_without_rectangle",
+                },
+            )
+        partial = _solve_partial_seam_layout(pieces, config)
+        if partial is not None and partial.status is not SolveStatus.NO_RECTANGLE_SOLUTION:
+            return partial
+        if skeleton_gap is not None:
+            diagnostics["skeleton_gap"] = skeleton_gap.diagnostics
+        if partial is not None:
+            diagnostics["partial_seam"] = partial.diagnostics
         return AssemblyResult(SolveStatus.NO_RECTANGLE_SOLUTION, diagnostics=diagnostics)
     ranked = sorted(layouts.values(), key=lambda entry: entry[0])
     best = ranked[0]
