@@ -63,6 +63,7 @@ _MIN_PARTIAL_SEAM_RATIO = 0.15
 _MAX_SOURCE_EDGES_PER_TARGET = 4
 _EQUIVALENT_LAYOUT_POSITION_MM = 20.0
 _EQUIVALENT_LAYOUT_ANGLE_RAD = math.radians(5.0)
+_FAST_SKELETON_STATE_LIMIT = 20
 
 
 def _cross(edge: tuple[tuple[float, float], tuple[float, float]], point: tuple[float, float]) -> float:
@@ -546,6 +547,7 @@ def _solve_segmented_anchor_layout(
 def _solve_skeleton_gap_layout(
     pieces: tuple[PieceObservation, ...],
     config: SolverConfig,
+    state_limit: int | None = None,
 ) -> AssemblyResult | None:
     """Attach one partial-edge piece to a connected whole-edge skeleton."""
     if len(pieces) < 3:
@@ -567,11 +569,11 @@ def _solve_skeleton_gap_layout(
     skeletons: list[_State] = []
     seen: set[tuple[tuple[int, float, float, float], ...]] = set()
     states_visited = 0
-    state_limit = min(config.max_states, 800)
+    effective_state_limit = min(config.max_states, 800 if state_limit is None else state_limit)
 
     def search(state: _State) -> None:
         nonlocal states_visited
-        if states_visited >= state_limit:
+        if states_visited >= effective_state_limit:
             return
         states_visited += 1
         if len(state.transforms) == len(pieces) - 1:
@@ -673,7 +675,8 @@ def _solve_skeleton_gap_layout(
         "skeleton_edge_tolerance_ratio": skeleton_config.edge_length_tolerance_ratio,
         "skeleton_count": len(skeletons),
         "states_visited": states_visited,
-        "state_limit_reached": states_visited >= state_limit,
+        "state_limit": effective_state_limit,
+        "state_limit_reached": states_visited >= effective_state_limit,
         "valid_layout_count": len(layouts),
         "pruned_overlap": pruned_overlap,
     }
@@ -701,6 +704,35 @@ def _solve_skeleton_gap_layout(
         score=best[0],
         diagnostics=diagnostics,
     )
+
+
+def _with_skeleton_state_limits(
+    result: AssemblyResult,
+    limits: tuple[int, ...],
+) -> AssemblyResult:
+    return replace(
+        result,
+        diagnostics={**result.diagnostics, "skeleton_state_limits": list(limits)},
+    )
+
+
+def _solve_skeleton_gap_with_retry(
+    pieces: tuple[PieceObservation, ...],
+    config: SolverConfig,
+) -> AssemblyResult | None:
+    full_limit = min(config.max_states, 800)
+    fast_limit = min(full_limit, _FAST_SKELETON_STATE_LIMIT)
+    fast = _solve_skeleton_gap_layout(pieces, config, state_limit=fast_limit)
+    if fast is not None and fast.status is SolveStatus.OK:
+        return _with_skeleton_state_limits(fast, (fast_limit,))
+    if fast_limit >= full_limit:
+        return None if fast is None else _with_skeleton_state_limits(fast, (fast_limit,))
+    if fast is not None and not fast.diagnostics["state_limit_reached"]:
+        return _with_skeleton_state_limits(fast, (fast_limit,))
+    full = _solve_skeleton_gap_layout(pieces, config, state_limit=full_limit)
+    if full is None:
+        return None if fast is None else _with_skeleton_state_limits(fast, (fast_limit,))
+    return _with_skeleton_state_limits(full, (fast_limit, full_limit))
 
 
 def _solve_partial_seam_layout(
@@ -906,7 +938,7 @@ def solve_layout(
         segmented = _solve_segmented_anchor_layout(pieces, config)
         if segmented is not None:
             return segmented
-        skeleton_gap = _solve_skeleton_gap_layout(pieces, config)
+        skeleton_gap = _solve_skeleton_gap_with_retry(pieces, config)
         if skeleton_gap is not None and skeleton_gap.status is not SolveStatus.NO_RECTANGLE_SOLUTION:
             return skeleton_gap
         if skeleton_gap is not None and skeleton_gap.diagnostics.get("skeleton_count", 0) > 0:
