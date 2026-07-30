@@ -76,6 +76,7 @@ _INTERCHANGEABLE_EDGE_TOLERANCE_MM = 4.0
 _INTERCHANGEABLE_EDGE_TOLERANCE_RATIO = 0.12
 _INTERCHANGEABLE_AREA_TOLERANCE_RATIO = 0.15
 _INTERCHANGEABLE_ANGLE_TOLERANCE_RAD = math.radians(10.0)
+_INTERCHANGEABLE_DOMINANCE_RATIO = 0.60
 _FAST_SKELETON_STATE_LIMIT = 20
 _GLOBAL_FIT_SEED_LIMIT = 8
 _GLOBAL_FIT_STEPS = ((2.0, 2.0), (1.0, 1.0))
@@ -502,6 +503,16 @@ def _layouts_are_effectively_equivalent(
     return _layouts_are_equivalent(first, second) or _layouts_are_interchangeably_equivalent(first, second, pieces_by_id)
 
 
+def _has_dominant_interchangeable_cluster(
+    best: dict[int, RigidTransform2D],
+    close: tuple[dict[int, RigidTransform2D], ...],
+    pieces_by_id: dict[int, PieceObservation],
+) -> tuple[bool, int, int]:
+    close_count = 1 + len(close)
+    equivalent_count = 1 + sum(_layouts_are_effectively_equivalent(best, layout, pieces_by_id) for layout in close)
+    return equivalent_count / max(close_count, 1) >= _INTERCHANGEABLE_DOMINANCE_RATIO, equivalent_count, close_count
+
+
 def _score_transforms(
     transforms: dict[int, RigidTransform2D],
     pieces_by_id: dict[int, PieceObservation],
@@ -782,7 +793,15 @@ def _solve_constrained_global_fit(
         close_layouts = tuple(
             entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
         )
-        if any(not _layouts_are_effectively_equivalent(best[1], entry[1], pieces_by_id) for entry in close_layouts):
+        accepted, equivalent_count, close_count = _has_dominant_interchangeable_cluster(
+            best[1],
+            tuple(entry[1] for entry in close_layouts),
+            pieces_by_id,
+        )
+        diagnostics["equivalent_layout_count"] = equivalent_count
+        diagnostics["close_layout_count"] = close_count
+        diagnostics["interchangeable_equivalent_majority"] = accepted
+        if not accepted:
             return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
         SolveStatus.OK,
@@ -1104,11 +1123,15 @@ def _solve_skeleton_gap_layout(
         close_layouts = tuple(
             entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
         )
-        equivalent_layout_count = 1 + sum(
-            _layouts_are_effectively_equivalent(best[1], entry[1], pieces_by_id) for entry in close_layouts
+        accepted, equivalent_layout_count, close_layout_count = _has_dominant_interchangeable_cluster(
+            best[1],
+            tuple(entry[1] for entry in close_layouts),
+            pieces_by_id,
         )
         diagnostics["equivalent_layout_count"] = equivalent_layout_count
-        if any(not _layouts_are_effectively_equivalent(best[1], entry[1], pieces_by_id) for entry in close_layouts):
+        diagnostics["close_layout_count"] = close_layout_count
+        diagnostics["interchangeable_equivalent_majority"] = accepted
+        if not accepted:
             return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
     return AssemblyResult(
         SolveStatus.OK,
