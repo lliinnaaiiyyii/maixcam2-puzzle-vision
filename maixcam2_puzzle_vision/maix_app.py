@@ -11,6 +11,7 @@ from .config import AppConfig, load_config
 from .geometry import edge_length, polygon_edges
 from .models import PieceObservation, PlanResult, SolveStatus
 from .pipeline import rectify_frame, solve_frame
+from .serial_protocol import build_uart_packet
 from .segmentation import extract_pieces
 
 
@@ -313,13 +314,29 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
 
 def main(config_path: str | None = None) -> None:
     # Imports stay local so desktop tests can import this module without MaixPy.
-    from maix import app, camera, display, image, key, time
+    from maix import app, camera, display, image, key, time, uart
 
     default_config_path, calibration_image_path = application_paths()
     solution_image_path, solution_payload_path = solution_paths()
     config = load_config(config_path or default_config_path)
     cam = camera.Camera(config.camera.width, config.camera.height, image.Format.FMT_BGR888)
     screen = display.Display()
+    try:
+        lower_controller_uart = uart.UART("/dev/ttyS4", 115200)
+    except Exception as error:
+        lower_controller_uart = None
+        print(
+            json.dumps(
+                {
+                    "status": "UART_INIT_FAILED",
+                    "port": "/dev/ttyS4",
+                    "baudrate": 115200,
+                    "error": str(error),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
     auto_solve = AutoSolveController()
     solve_request = SolveRequest()
     capture_request = SolveRequest()
@@ -365,6 +382,36 @@ def main(config_path: str | None = None) -> None:
                     json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
                 )
+                packet = build_uart_packet(result)
+                if lower_controller_uart is not None and packet is not None:
+                    try:
+                        lower_controller_uart.write(packet.encode("ascii"))
+                        print(
+                            json.dumps(
+                                {
+                                    "status": "UART_SENT",
+                                    "port": "/dev/ttyS4",
+                                    "baudrate": 115200,
+                                    "packet": packet,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                    except Exception as error:
+                        print(
+                            json.dumps(
+                                {
+                                    "status": "UART_SEND_FAILED",
+                                    "port": "/dev/ttyS4",
+                                    "baudrate": 115200,
+                                    "packet": packet,
+                                    "error": str(error),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
             print(json.dumps(payload, ensure_ascii=False), flush=True)
         screen.show(image.cv2image(frame_bgr if latest_overlay is None else latest_overlay, bgr=True, copy=False))
 
