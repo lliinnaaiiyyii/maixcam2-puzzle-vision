@@ -61,7 +61,20 @@ def draw_solution(board_bgr: np.ndarray, result: PlanResult, config: AppConfig) 
     source_color = (0, 0, 255)
     source_outline = (0, 255, 255)
     assembly_outline = (255, 255, 0)
+    board_outline = (255, 180, 0)
+    divider_color = (0, 165, 255)
     source_pieces = {piece.piece_id: piece for piece in extract_pieces(board_bgr, config)}
+    board_width = int(round(config.board.size_mm[0] * scale))
+    board_height = int(round(config.board.size_mm[1] * scale))
+    if overlay.shape[:2] == (board_height, board_width):
+        inset = max(2, int(round(1.5 * scale)))
+        divider_x = int(round(config.board.size_mm[0] * scale / 2.0))
+        top_left = (inset, inset)
+        bottom_right = (board_width - 1 - inset, board_height - 1 - inset)
+        cv2.rectangle(overlay, top_left, bottom_right, target_outline, 5, cv2.LINE_8)
+        cv2.rectangle(overlay, top_left, bottom_right, board_outline, 2, cv2.LINE_8)
+        cv2.line(overlay, (divider_x, inset), (divider_x, board_height - 1 - inset), target_outline, 5, cv2.LINE_8)
+        cv2.line(overlay, (divider_x, inset), (divider_x, board_height - 1 - inset), divider_color, 2, cv2.LINE_8)
     cv2.putText(
         overlay,
         f"{result.status.value} confidence={result.confidence:.2f}",
