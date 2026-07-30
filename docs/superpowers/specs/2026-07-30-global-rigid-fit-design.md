@@ -40,7 +40,7 @@ The search uses a small deterministic coordinate-descent neighbourhood around th
 
 The best fitted candidate is accepted only when all of these hold:
 
-- its rectangle fill ratio meets the existing configured threshold;
+- its rectangle fill ratio meets the existing partial-gap fallback threshold, `max(0.90, config.min_rectangle_fill_ratio - 0.04)`;
 - every pairwise overlap is below the existing configured ratio;
 - mean seam residual stays below a new bounded tolerance derived from the existing seam tolerance;
 - the pose change for each piece is within the fitting bound;
