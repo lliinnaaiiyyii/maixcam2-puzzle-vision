@@ -51,8 +51,17 @@ def plan_assembly(pieces: tuple[PieceObservation, ...], assembly: AssemblyResult
     placed = tuple(apply_transform_polygon(piece.polygon_mm, assembly.transforms[piece.piece_id]) for piece in pieces)
     angle, min_x, min_y, width, height = oriented_bounding_box(placed)
     normalizer = RigidTransform2D(-angle, -min_x, -min_y)
+    target_roi_width, target_roi_height = config.board.target_roi_mm[2:]
+    rectangle_is_wide = width > height
+    target_roi_is_wide = target_roi_width > target_roi_height
+    target_orientation = RigidTransform2D()
+    if width != height and target_roi_width != target_roi_height and rectangle_is_wide != target_roi_is_wide:
+        # The normalized rectangle spans [0, width] x [0, height]. Rotate it once
+        # so its long side matches the target ROI's long side, then move it positive.
+        target_orientation = RigidTransform2D(math.pi / 2.0, height, 0.0)
+        width, height = height, width
     target_origin = (config.board.target_center_mm[0] - width / 2.0, config.board.target_center_mm[1] - height / 2.0)
-    target_transform = compose(RigidTransform2D(0.0, *target_origin), normalizer)
+    target_transform = compose(RigidTransform2D(0.0, *target_origin), compose(target_orientation, normalizer))
     target_polygons = tuple(
         apply_transform_polygon(piece.polygon_mm, compose(target_transform, assembly.transforms[piece.piece_id]))
         for piece in pieces
