@@ -16,11 +16,27 @@ def _green_a4_frame() -> np.ndarray:
     return frame
 
 
+def _distant_green_a4_frame() -> tuple[np.ndarray, np.ndarray]:
+    frame = np.full((720, 1280, 3), (35, 65, 95), dtype=np.uint8)
+    corners = np.asarray(((430, 220), (750, 220), (750, 420), (430, 420)), dtype=np.int32)
+    cv2.fillConvexPoly(frame, corners, (20, 230, 40), cv2.LINE_AA)
+    return frame, corners.astype(np.float64)
+
+
 def test_detect_a4_corners_finds_green_quadrilateral_around_white_pieces() -> None:
     corners = detect_a4_corners(_green_a4_frame(), AutoCalibrationConfig())
 
     assert corners is not None
     np.testing.assert_allclose(np.asarray(corners), EXPECTED_CORNERS, atol=6.0)
+
+
+def test_detect_a4_corners_accepts_distant_green_a4() -> None:
+    frame, expected_corners = _distant_green_a4_frame()
+
+    corners = detect_a4_corners(frame, AutoCalibrationConfig())
+
+    assert corners is not None
+    np.testing.assert_allclose(np.asarray(corners), expected_corners, atol=4.0)
 
 
 def test_auto_board_calibrator_requires_three_stable_frames() -> None:

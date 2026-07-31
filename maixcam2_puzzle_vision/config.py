@@ -78,7 +78,7 @@ class AutoCalibrationConfig:
     hue_max: int = 95
     saturation_min: int = 80
     value_min: int = 60
-    min_area_ratio: float = 0.15
+    min_area_ratio: float = 0.06
     border_margin_px: int = 4
     stable_frames: int = 3
     corner_stability_px: float = 6.0
