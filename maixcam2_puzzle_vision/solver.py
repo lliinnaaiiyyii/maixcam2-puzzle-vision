@@ -84,6 +84,9 @@ _GLOBAL_FIT_SEED_LIMIT = 8
 _GLOBAL_FIT_STEPS = ((2.0, 2.0), (1.0, 1.0))
 _GLOBAL_FIT_MAX_SHIFT_MM = math.sqrt(18.0)
 _GLOBAL_FIT_MAX_ANGLE_RAD = math.radians(3.0)
+_PENTAGON_PARTIAL_SOURCE_EDGE_LIMIT = 4
+_PENTAGON_PARTIAL_POSITIONS = (0.0, 0.5, 1.0)
+_PENTAGON_PARTIAL_BEAM_WIDTH = 40
 
 
 def _cross(edge: tuple[tuple[float, float], tuple[float, float]], point: tuple[float, float]) -> float:
@@ -163,6 +166,7 @@ def _partial_alignment(
 
 def _select_partial_candidates(
     candidates: list[PartialSeamCandidate],
+    max_source_edges: int = _MAX_SOURCE_EDGES_PER_TARGET,
 ) -> tuple[PartialSeamCandidate, ...]:
     """Keep a small, diverse set of source edges for every long target edge."""
     grouped: dict[tuple[int, int, int], dict[int, list[PartialSeamCandidate]]] = {}
@@ -184,13 +188,17 @@ def _select_partial_candidates(
                 ),
             ),
         )
-        for group in source_groups[:_MAX_SOURCE_EDGES_PER_TARGET]:
+        for group in source_groups[:max_source_edges]:
             selected.extend(group)
     return tuple(selected)
 
 
 def build_partial_seam_candidates(
-    pieces: tuple[PieceObservation, ...], config: SolverConfig
+    pieces: tuple[PieceObservation, ...],
+    config: SolverConfig,
+    *,
+    max_source_edges: int = _MAX_SOURCE_EDGES_PER_TARGET,
+    partial_positions: tuple[float, ...] = _PARTIAL_POSITIONS,
 ) -> tuple[PartialSeamCandidate, ...]:
     """Build bounded whole-edge and short-to-long shared-cut hypotheses."""
     forward: list[PartialSeamCandidate] = []
@@ -208,7 +216,7 @@ def build_partial_seam_candidates(
                 if source_length / max(target_length, 1e-6) < _MIN_PARTIAL_SEAM_RATIO:
                     continue
                 is_whole_edge = _lengths_match(target_length, source_length, config)
-                positions = (0.0,) if is_whole_edge else _PARTIAL_POSITIONS
+                positions = (0.0,) if is_whole_edge else partial_positions
                 for position in positions:
                     interval_start = position * (1.0 - source_length / target_length)
                     interval_end = interval_start + source_length / target_length
@@ -234,7 +242,7 @@ def build_partial_seam_candidates(
                             0.0 if is_whole_edge else 1.0 - source_length / target_length,
                         )
                     )
-    selected = _select_partial_candidates(forward)
+    selected = _select_partial_candidates(forward, max_source_edges)
     candidates: list[PartialSeamCandidate] = []
     for candidate in selected:
         candidates.append(candidate)
@@ -272,9 +280,20 @@ def _minimum_rectangle(polygons: tuple[tuple[tuple[float, float], ...], ...]) ->
     angles = {round(math.atan2(end[1] - start[1], end[0] - start[0]), 10) for polygon in polygons for start, end in polygon_edges(polygon)}
     best: tuple[float, float, float] | None = None
     for angle in angles:
-        rotated = tuple(rotate_point(point, -angle) for point in points)
-        width = max(point[0] for point in rotated) - min(point[0] for point in rotated)
-        height = max(point[1] for point in rotated) - min(point[1] for point in rotated)
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        first_x, first_y = points[0]
+        minimum_x = maximum_x = first_x * cosine + first_y * sine
+        minimum_y = maximum_y = -first_x * sine + first_y * cosine
+        for point_x, point_y in points[1:]:
+            projected_x = point_x * cosine + point_y * sine
+            projected_y = -point_x * sine + point_y * cosine
+            minimum_x = min(minimum_x, projected_x)
+            maximum_x = max(maximum_x, projected_x)
+            minimum_y = min(minimum_y, projected_y)
+            maximum_y = max(maximum_y, projected_y)
+        width = maximum_x - minimum_x
+        height = maximum_y - minimum_y
         candidate = width, height, angle
         if best is None or width * height < best[0] * best[1]:
             best = candidate
@@ -1285,6 +1304,160 @@ def _solve_skeleton_gap_with_retry(
     return _with_skeleton_state_limits(full, (fast_limit, full_limit))
 
 
+def _solve_pentagon_partial_beam_layout(
+    pieces: tuple[PieceObservation, ...],
+    config: SolverConfig,
+) -> AssemblyResult | None:
+    """Search bounded multi-partial seams before falling back to the broad solver."""
+    if len(pieces) < 2 or not any(len(piece.polygon_mm) >= 5 for piece in pieces):
+        return None
+    pieces_by_id = {piece.piece_id: piece for piece in pieces}
+    piece_areas = {
+        piece.piece_id: abs(polygon_signed_area(piece.polygon_mm))
+        for piece in pieces
+    }
+    candidates = build_partial_seam_candidates(
+        pieces,
+        config,
+        max_source_edges=_PENTAGON_PARTIAL_SOURCE_EDGE_LIMIT,
+        partial_positions=_PENTAGON_PARTIAL_POSITIONS,
+    )
+    if not candidates:
+        return None
+    candidates_by_target: dict[int, tuple[PartialSeamCandidate, ...]] = {}
+    for candidate in candidates:
+        candidates_by_target[candidate.piece_a] = (
+            candidates_by_target.get(candidate.piece_a, ()) + (candidate,)
+        )
+
+    total_area = sum(piece_areas.values())
+    maximum_rectangle_area = total_area / max(config.min_rectangle_fill_ratio, 1e-6)
+    beam = [_PartialState({piece.piece_id: RigidTransform2D()}, {}, 0.0) for piece in pieces]
+    state_layers = [len(beam)]
+    states_generated = 0
+    pruned_overlap = 0
+    pruned_interval = 0
+    pruned_area = 0
+
+    for _depth in range(1, len(pieces)):
+        next_entries: dict[
+            tuple[tuple[int, float, float, float], ...],
+            tuple[float, _PartialState],
+        ] = {}
+        for state in beam:
+            placed_polygons = {
+                piece_id: apply_transform_polygon(pieces_by_id[piece_id].polygon_mm, transform)
+                for piece_id, transform in state.transforms.items()
+            }
+            placed_area = sum(piece_areas[piece_id] for piece_id in state.transforms)
+            for target_id, target_transform in state.transforms.items():
+                for candidate in candidates_by_target.get(target_id, ()):
+                    source_id = candidate.piece_b
+                    if source_id in state.transforms:
+                        continue
+                    target_key = candidate.piece_a, candidate.edge_a
+                    source_key = candidate.piece_b, candidate.edge_b
+                    if not _interval_is_available(state.used_intervals, target_key, candidate.interval_a):
+                        pruned_interval += 1
+                        continue
+                    if not _interval_is_available(state.used_intervals, source_key, candidate.interval_b):
+                        pruned_interval += 1
+                        continue
+                    source_transform = compose(target_transform, candidate.transform_b_to_a)
+                    source_polygon = apply_transform_polygon(
+                        pieces_by_id[source_id].polygon_mm,
+                        source_transform,
+                    )
+                    collision = False
+                    for existing_polygon in placed_polygons.values():
+                        allowed_overlap = max(config.max_overlap_ratio, 0.02) * min(
+                            piece_areas[source_id],
+                            abs(polygon_signed_area(existing_polygon)),
+                        )
+                        if polygon_intersection_area(source_polygon, existing_polygon) > allowed_overlap + 1e-6:
+                            collision = True
+                            break
+                    if collision:
+                        pruned_overlap += 1
+                        continue
+                    updated_transforms = {**state.transforms, source_id: source_transform}
+                    polygons = tuple(placed_polygons.values()) + (source_polygon,)
+                    width, height, _ = _minimum_rectangle(polygons)
+                    rectangle_area = width * height
+                    if rectangle_area > maximum_rectangle_area:
+                        pruned_area += 1
+                        continue
+                    used = _add_used_interval(state.used_intervals, target_key, candidate.interval_a)
+                    used = _add_used_interval(used, source_key, candidate.interval_b)
+                    penalty = state.penalty + candidate.length_gap_ratio
+                    priority = rectangle_area / max(placed_area + piece_areas[source_id], 1e-6) + 0.02 * penalty
+                    updated_state = _PartialState(updated_transforms, used, penalty)
+                    signature = _transforms_signature(updated_transforms)
+                    previous = next_entries.get(signature)
+                    if previous is None or priority < previous[0]:
+                        next_entries[signature] = priority, updated_state
+                    states_generated += 1
+        ranked_states = sorted(next_entries.values(), key=lambda entry: entry[0])
+        beam = [entry[1] for entry in ranked_states[:_PENTAGON_PARTIAL_BEAM_WIDTH]]
+        state_layers.append(len(beam))
+        if not beam:
+            break
+
+    layouts: dict[
+        tuple[tuple[int, float, float, float], ...],
+        tuple[float, dict[int, RigidTransform2D], tuple[float, float], float],
+    ] = {}
+    for state in beam:
+        if len(state.transforms) != len(pieces):
+            continue
+        scored = _score_transforms(state.transforms, pieces_by_id, config, state.penalty)
+        if scored is None:
+            continue
+        signature = _layout_cluster_signature(state.transforms)
+        entry = scored[0], state.transforms, scored[1], scored[2]
+        if signature not in layouts or entry[0] < layouts[signature][0]:
+            layouts[signature] = entry
+
+    diagnostics = {
+        "strategy": "pentagon_partial_beam",
+        "candidate_count": len(candidates),
+        "beam_width": _PENTAGON_PARTIAL_BEAM_WIDTH,
+        "state_layers": state_layers,
+        "states_generated": states_generated,
+        "valid_layout_count": len(layouts),
+        "pruned_overlap": pruned_overlap,
+        "pruned_interval": pruned_interval,
+        "pruned_area": pruned_area,
+    }
+    if not layouts:
+        return AssemblyResult(SolveStatus.NO_RECTANGLE_SOLUTION, diagnostics=diagnostics)
+    ranked = sorted(layouts.values(), key=lambda entry: entry[0])
+    best = ranked[0]
+    diagnostics["best_score"] = best[0]
+    if len(ranked) > 1:
+        diagnostics["second_score"] = ranked[1][0]
+        close_layouts = tuple(
+            entry for entry in ranked[1:] if entry[0] - best[0] < config.ambiguity_margin
+        )
+        accepted, ambiguity_diagnostics = _ranked_layout_ambiguity_is_acceptable(
+            best[1],
+            tuple(entry[1] for entry in close_layouts),
+            pieces_by_id,
+            config,
+        )
+        diagnostics.update(ambiguity_diagnostics)
+        if not accepted:
+            return AssemblyResult(SolveStatus.AMBIGUOUS, diagnostics=diagnostics)
+    return AssemblyResult(
+        SolveStatus.OK,
+        transforms=best[1],
+        rectangle_size_mm=best[2],
+        fill_ratio=best[3],
+        score=best[0],
+        diagnostics=diagnostics,
+    )
+
+
 def _solve_partial_seam_layout(
     pieces: tuple[PieceObservation, ...],
     config: SolverConfig,
@@ -1292,7 +1465,13 @@ def _solve_partial_seam_layout(
     if len(pieces) < 2:
         return None
     pieces_by_id = {piece.piece_id: piece for piece in pieces}
-    candidates = build_partial_seam_candidates(pieces, config)
+    has_pentagon = any(len(piece.polygon_mm) >= 5 for piece in pieces)
+    candidates = build_partial_seam_candidates(
+        pieces,
+        config,
+        max_source_edges=2 if has_pentagon else _MAX_SOURCE_EDGES_PER_TARGET,
+        partial_positions=(0.0, 0.5, 1.0) if has_pentagon else _PARTIAL_POSITIONS,
+    )
     if not candidates:
         return None
     candidates_by_target: dict[int, tuple[PartialSeamCandidate, ...]] = {}
@@ -1499,25 +1678,26 @@ def solve_layout(
         segmented = _solve_segmented_anchor_layout(pieces, config)
         if segmented is not None:
             return segmented
+        pentagon_beam = None
+        if any(len(piece.polygon_mm) >= 5 for piece in pieces):
+            # A pentagon commonly has one long cut edge shared by two shorter pieces.
+            pentagon_beam = _solve_pentagon_partial_beam_layout(pieces, config)
+            if pentagon_beam is not None and pentagon_beam.status is SolveStatus.OK:
+                return pentagon_beam
         skeleton_gap = _solve_skeleton_gap_with_retry(pieces, config)
         if skeleton_gap is not None and skeleton_gap.status is not SolveStatus.NO_RECTANGLE_SOLUTION:
             return skeleton_gap
-        if skeleton_gap is not None and skeleton_gap.diagnostics.get("skeleton_count", 0) > 0:
-            return AssemblyResult(
-                SolveStatus.NO_RECTANGLE_SOLUTION,
-                diagnostics={
-                    **diagnostics,
-                    "skeleton_gap": skeleton_gap.diagnostics,
-                    "reason": "whole_edge_skeleton_rejected_without_rectangle",
-                },
-            )
         partial = _solve_partial_seam_layout(pieces, config)
         if partial is not None and partial.status is not SolveStatus.NO_RECTANGLE_SOLUTION:
             return partial
+        if pentagon_beam is not None and pentagon_beam.status is not SolveStatus.NO_RECTANGLE_SOLUTION:
+            return pentagon_beam
         if skeleton_gap is not None:
             diagnostics["skeleton_gap"] = skeleton_gap.diagnostics
         if partial is not None:
             diagnostics["partial_seam"] = partial.diagnostics
+        if pentagon_beam is not None:
+            diagnostics["pentagon_partial_beam"] = pentagon_beam.diagnostics
         return AssemblyResult(SolveStatus.NO_RECTANGLE_SOLUTION, diagnostics=diagnostics)
     ranked = sorted(layouts.values(), key=lambda entry: entry[0])
     best = ranked[0]
